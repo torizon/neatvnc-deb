@@ -8,7 +8,7 @@ Build-Depends:
  gnutls-dev,
  libaml-dev,
  libdrm-dev,
- libjpeg-dev,
+ libturbojpeg0-dev,
  libpixman-1-dev,
  meson,
  pkg-config,
