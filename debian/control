@@ -8,8 +8,8 @@ Build-Depends:
  gnutls-dev,
  libaml-dev,
  libdrm-dev,
- libturbojpeg0-dev,
  libpixman-1-dev,
+ libturbojpeg0-dev,
  meson,
  pkg-config,
  zlib1g-dev,
@@ -23,7 +23,12 @@ Section: libdevel
 Architecture: any
 Multi-Arch: same
 Depends:
+ gnutls-dev,
+ libaml-dev,
  libneatvnc0 (= ${binary:Version}),
+ libpixman-1-dev,
+ libturbojpeg0-dev,
+ zlib1g-dev,
  ${misc:Depends},
 Description: Fast and neat VNC server library (development files)
  Neatvnc is a liberally licensed VNC server library that's intended

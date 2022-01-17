@@ -1,3 +1,12 @@
+neatvnc (0.4.0+dfsg-2) unstable; urgency=medium
+
+  * Source-only upload.
+  * debian/control: Add missing dependency for package libneatvnc-dev:
+    gnutls-dev, libaml-dev, libpixman-1-dev, libturbojpeg0-dev,
+    zlib1g-dev.
+
+ -- Boyuan Yang <byang@debian.org>  Mon, 17 Jan 2022 14:17:42 -0500
+
 neatvnc (0.4.0+dfsg-1) unstable; urgency=medium
 
   * Initial release.
