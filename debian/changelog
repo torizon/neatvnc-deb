@@ -1,3 +1,9 @@
+neatvnc (0.5.1+dfsg-1) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Boyuan Yang <byang@debian.org>  Wed, 13 Jul 2022 09:32:05 -0400
+
 neatvnc (0.4.0+dfsg-2) unstable; urgency=medium
 
   * Source-only upload.
