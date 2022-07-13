@@ -24,7 +24,6 @@
 #include "sys/queue.h"
 
 #include "neatvnc.h"
-#include "tight.h"
 #include "config.h"
 
 #ifdef ENABLE_TLS
@@ -57,6 +56,7 @@ struct nvnc_display;
 
 struct nvnc_common {
 	void* userdata;
+	nvnc_cleanup_fn cleanup_fn;
 };
 
 struct cut_text {
@@ -79,9 +79,8 @@ struct nvnc_client {
 	struct pixman_region16 damage;
 	int n_pending_requests;
 	bool is_updating;
+	struct nvnc_fb* current_fb;
 	nvnc_client_fn cleanup_fn;
-	z_stream z_stream;
-	struct tight_encoder tight_encoder;
 	size_t buffer_index;
 	size_t buffer_len;
 	uint8_t msg_buffer[MSG_BUFFER_SIZE];
@@ -89,6 +88,8 @@ struct nvnc_client {
 	uint32_t known_height;
 	struct cut_text cut_text;
 	bool is_qemu_key_ext_notified;
+	struct encoder* encoder;
+	uint32_t cursor_seq;
 };
 
 LIST_HEAD(nvnc_client_list, nvnc_client);
@@ -97,7 +98,6 @@ struct nvnc {
 	struct nvnc_common common;
 	int fd;
 	struct aml_handler* poll_handle;
-	struct aml_idle* dispatch_handler;
 	struct nvnc_client_list clients;
 	char name[256];
 	void* userdata;
@@ -108,12 +108,20 @@ struct nvnc {
 	nvnc_client_fn new_client_fn;
 	nvnc_cut_text_fn cut_text_fn;
 	struct nvnc_display* display;
+	struct {
+		struct nvnc_fb* buffer;
+		uint32_t width, height;
+		uint32_t hotspot_x, hotspot_y;
+	} cursor;
+	uint32_t cursor_seq;
 
 #ifdef ENABLE_TLS
 	gnutls_certificate_credentials_t tls_creds;
 	nvnc_auth_fn auth_fn;
 	void* auth_ud;
 #endif
+
+	uint32_t n_damage_clients;
 };
 
 void nvnc__damage_region(struct nvnc* self,

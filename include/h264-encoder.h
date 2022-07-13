@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 Andri Yngvason
+ * Copyright (c) 2021 - 2022 Andri Yngvason
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -13,20 +13,26 @@
  * OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
  * PERFORMANCE OF THIS SOFTWARE.
  */
-
 #pragma once
 
 #include <stdint.h>
 #include <unistd.h>
-#include <zlib.h>
 
+struct h264_encoder;
 struct nvnc_fb;
-struct rfb_pixel_format;
-struct pixman_region16;
-struct vec;
 
-int zrle_encode_frame(z_stream* zs, struct vec* dst,
-                      const struct rfb_pixel_format* dst_fmt,
-                      const struct nvnc_fb* src,
-                      const struct rfb_pixel_format* src_fmt,
-                      struct pixman_region16* region);
+typedef void (*h264_encoder_packet_handler_fn)(const void* payload, size_t size,
+		uint64_t pts, void* userdata);
+
+struct h264_encoder* h264_encoder_create(uint32_t width, uint32_t height,
+		uint32_t format);
+
+void h264_encoder_destroy(struct h264_encoder*);
+
+void h264_encoder_set_packet_handler_fn(struct h264_encoder*,
+		h264_encoder_packet_handler_fn);
+void h264_encoder_set_userdata(struct h264_encoder*, void* userdata);
+
+void h264_encoder_feed(struct h264_encoder*, struct nvnc_fb*);
+
+void h264_encoder_request_keyframe(struct h264_encoder*);

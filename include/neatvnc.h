@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 - 2020 Andri Yngvason
+ * Copyright (c) 2019 - 2022 Andri Yngvason
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -18,12 +18,43 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <assert.h>
+
+#define NVNC_NO_PTS UINT64_MAX
+
+#define nvnc_log(lvl, fmt, ...) do { \
+	assert(lvl != NVNC_LOG_TRACE); \
+	struct nvnc_log_data ld = { \
+		.level = lvl, \
+		.file = __FILE__, \
+		.line = __LINE__, \
+	}; \
+	nvnc__log(&ld, fmt, ## __VA_ARGS__); \
+} while(0)
+
+#ifndef NDEBUG
+#define nvnc_trace(fmt, ...) do { \
+	struct nvnc_log_data ld = { \
+		.level = NVNC_LOG_TRACE, \
+		.file = __FILE__, \
+		.line = __LINE__, \
+	}; \
+	nvnc__log(&ld, fmt, ## __VA_ARGS__); \
+} while(0)
+#else
+#define nvnc_trace(...)
+#endif
 
 struct nvnc;
 struct nvnc_client;
 struct nvnc_display;
 struct nvnc_fb;
+struct nvnc_fb_pool;
 struct pixman_region16;
+struct gbm_bo;
 
 enum nvnc_button_mask {
 	NVNC_BUTTON_LEFT = 1 << 0,
@@ -33,8 +64,37 @@ enum nvnc_button_mask {
 	NVNC_SCROLL_DOWN = 1 << 4,
 };
 
-enum nvnc_fb_flags {
-	NVNC_FB_PARTIAL = 1 << 0, // The buffer contains only the damaged region
+enum nvnc_fb_type {
+	NVNC_FB_UNSPEC = 0,
+	NVNC_FB_SIMPLE,
+	NVNC_FB_GBM_BO,
+};
+
+/* This is the same as wl_output_transform */
+enum nvnc_transform {
+	NVNC_TRANSFORM_NORMAL = 0,
+	NVNC_TRANSFORM_90 = 1,
+	NVNC_TRANSFORM_180 = 2,
+	NVNC_TRANSFORM_270 = 3,
+	NVNC_TRANSFORM_FLIPPED = 4,
+	NVNC_TRANSFORM_FLIPPED_90 = 5,
+	NVNC_TRANSFORM_FLIPPED_180 = 6,
+	NVNC_TRANSFORM_FLIPPED_270 = 7,
+};
+
+enum nvnc_log_level {
+	NVNC_LOG_PANIC = 0,
+	NVNC_LOG_ERROR = 1,
+	NVNC_LOG_WARNING = 2,
+	NVNC_LOG_INFO = 3,
+	NVNC_LOG_DEBUG = 4,
+	NVNC_LOG_TRACE = 5,
+};
+
+struct nvnc_log_data {
+	enum nvnc_log_level level;
+	const char* file;
+	int line;
 };
 
 typedef void (*nvnc_key_fn)(struct nvnc_client*, uint32_t key,
@@ -48,18 +108,21 @@ typedef void (*nvnc_client_fn)(struct nvnc_client*);
 typedef void (*nvnc_damage_fn)(struct pixman_region16* damage, void* userdata);
 typedef bool (*nvnc_auth_fn)(const char* username, const char* password,
                              void* userdata);
-typedef void (*nvnc_render_fn)(struct nvnc_display*, struct nvnc_fb*);
 typedef void (*nvnc_cut_text_fn)(struct nvnc*, const char* text, uint32_t len);
+typedef void (*nvnc_fb_release_fn)(struct nvnc_fb*, void* context);
+typedef void (*nvnc_cleanup_fn)(void* userdata);
+typedef void (*nvnc_log_fn)(const struct nvnc_log_data*, const char* message);
 
 extern const char nvnc_version[];
 
 struct nvnc* nvnc_open(const char* addr, uint16_t port);
+struct nvnc* nvnc_open_unix(const char *addr);
 void nvnc_close(struct nvnc* self);
 
 void nvnc_add_display(struct nvnc*, struct nvnc_display*);
 void nvnc_remove_display(struct nvnc*, struct nvnc_display*);
 
-void nvnc_set_userdata(void* self, void* userdata);
+void nvnc_set_userdata(void* self, void* userdata, nvnc_cleanup_fn);
 void* nvnc_get_userdata(const void* self);
 
 struct nvnc* nvnc_client_get_server(const struct nvnc_client* client);
@@ -79,18 +142,42 @@ int nvnc_enable_auth(struct nvnc* self, const char* privkey_path,
                      const char* cert_path, nvnc_auth_fn, void* userdata);
 
 struct nvnc_fb* nvnc_fb_new(uint16_t width, uint16_t height,
-                            uint32_t fourcc_format);
+                            uint32_t fourcc_format, uint16_t stride);
+struct nvnc_fb* nvnc_fb_from_buffer(void* buffer, uint16_t width,
+				    uint16_t height, uint32_t fourcc_format,
+				    int32_t stride);
+struct nvnc_fb* nvnc_fb_from_gbm_bo(struct gbm_bo* bo);
 
 void nvnc_fb_ref(struct nvnc_fb* fb);
 void nvnc_fb_unref(struct nvnc_fb* fb);
 
-enum nvnc_fb_flags nvnc_fb_get_flags(const struct nvnc_fb*);
-void nvnc_fb_set_flags(struct nvnc_fb*, enum nvnc_fb_flags);
+void nvnc_fb_set_release_fn(struct nvnc_fb* fb, nvnc_fb_release_fn fn,
+			    void* context);
+void nvnc_fb_set_transform(struct nvnc_fb* fb, enum nvnc_transform);
+
+void nvnc_fb_set_pts(struct nvnc_fb* fb, uint64_t pts);
 
 void* nvnc_fb_get_addr(const struct nvnc_fb* fb);
 uint16_t nvnc_fb_get_width(const struct nvnc_fb* fb);
 uint16_t nvnc_fb_get_height(const struct nvnc_fb* fb);
 uint32_t nvnc_fb_get_fourcc_format(const struct nvnc_fb* fb);
+int32_t nvnc_fb_get_stride(const struct nvnc_fb* fb);
+int nvnc_fb_get_pixel_size(const struct nvnc_fb* fb);
+struct gbm_bo* nvnc_fb_get_gbm_bo(const struct nvnc_fb* fb);
+enum nvnc_transform nvnc_fb_get_transform(const struct nvnc_fb* fb);
+enum nvnc_fb_type nvnc_fb_get_type(const struct nvnc_fb* fb);
+uint64_t nvnc_fb_get_pts(const struct nvnc_fb* fb);
+
+struct nvnc_fb_pool* nvnc_fb_pool_new(uint16_t width, uint16_t height,
+				      uint32_t fourcc_format, uint16_t stride);
+bool nvnc_fb_pool_resize(struct nvnc_fb_pool*, uint16_t width, uint16_t height,
+			 uint32_t fourcc_format, uint16_t stride);
+
+void nvnc_fb_pool_ref(struct nvnc_fb_pool*);
+void nvnc_fb_pool_unref(struct nvnc_fb_pool*);
+
+struct nvnc_fb* nvnc_fb_pool_acquire(struct nvnc_fb_pool*);
+void nvnc_fb_pool_release(struct nvnc_fb_pool*, struct nvnc_fb*);
 
 struct nvnc_display* nvnc_display_new(uint16_t x_pos, uint16_t y_pos);
 void nvnc_display_ref(struct nvnc_display*);
@@ -98,21 +185,15 @@ void nvnc_display_unref(struct nvnc_display*);
 
 struct nvnc* nvnc_display_get_server(const struct nvnc_display*);
 
-void nvnc_display_set_render_fn(struct nvnc_display* self, nvnc_render_fn fn);
-void nvnc_display_set_buffer(struct nvnc_display*, struct nvnc_fb*);
-
-void nvnc_display_damage_region(struct nvnc_display*,
-                                const struct pixman_region16*);
-void nvnc_display_damage_whole(struct nvnc_display*);
-
-/*
- * Find the regions that differ between fb0 and fb1. Regions outside the hinted
- * rectangle region are not guaranteed to be checked.
- *
- * This is a utility function that may be used to reduce network traffic.
- */
-int nvnc_check_damage(struct nvnc_fb* fb0, struct nvnc_fb* fb1,
-                      int x_hint, int y_hint, int width_hint, int height_hint,
-                      nvnc_damage_fn on_check_done, void* userdata);
+void nvnc_display_feed_buffer(struct nvnc_display*, struct nvnc_fb*,
+			      struct pixman_region16* damage);
 
 void nvnc_send_cut_text(struct nvnc*, const char* text, uint32_t len);
+
+void nvnc_set_cursor(struct nvnc*, struct nvnc_fb*, uint16_t width,
+		     uint16_t height, uint16_t hotspot_x, uint16_t hotspot_y,
+		     bool is_damaged);
+
+void nvnc_set_log_fn(nvnc_log_fn);
+void nvnc_set_log_level(enum nvnc_log_level);
+void nvnc__log(const struct nvnc_log_data*, const char* fmt, ...);

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 - 2020 Andri Yngvason
+ * Copyright (c) 2022 Andri Yngvason
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -16,12 +16,12 @@
 
 #pragma once
 
+#include <stdint.h>
+
+struct vec;
 struct nvnc_fb;
 struct rfb_pixel_format;
-struct pixman_region16;
-struct vec;
 
-int raw_encode_frame(struct vec* dst, const struct rfb_pixel_format* dst_fmt,
-                     const struct nvnc_fb* src,
-                     const struct rfb_pixel_format* src_fmt,
-                     struct pixman_region16* region);
+int cursor_encode(struct vec* dst, struct rfb_pixel_format* pixfmt,
+		struct nvnc_fb* image, uint32_t width, uint32_t height,
+		uint32_t x_hotspot, uint32_t y_hotspot);

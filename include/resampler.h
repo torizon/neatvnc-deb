@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 - 2022 Andri Yngvason
+ * Copyright (c) 2021 Andri Yngvason
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -16,40 +16,22 @@
 
 #pragma once
 
-#include <unistd.h>
 #include <stdint.h>
-#include <stdatomic.h>
-#include <stdbool.h>
 
-#include "neatvnc.h"
-#include "common.h"
+struct nvnc_fb;
+struct pixman_region16;
 
-struct gbm_bo;
+struct resampler;
 
-struct nvnc_fb {
-	struct nvnc_common common;
-	enum nvnc_fb_type type;
-	int ref;
-	int hold_count;
-	nvnc_fb_release_fn on_release;
-	void* release_context;
-	bool is_external;
-	uint16_t width;
-	uint16_t height;
-	uint32_t fourcc_format;
-	enum nvnc_transform transform;
-	uint64_t pts; // in micro seconds
+typedef void (*resampler_fn)(struct nvnc_fb*, struct pixman_region16* damage,
+			     void* userdata);
 
-	/* main memory buffer attributes */
-	void* addr;
-	int32_t stride;
+struct resampler* resampler_create(void);
+void resampler_destroy(struct resampler*);
 
-	/* dmabuf attributes */
-	struct gbm_bo* bo;
-	void* bo_map_handle;
-};
+int resampler_feed(struct resampler*, struct nvnc_fb* fb,
+		struct pixman_region16* damage, resampler_fn on_done,
+		void* userdata);
 
-void nvnc_fb_hold(struct nvnc_fb* fb);
-void nvnc_fb_release(struct nvnc_fb* fb);
-int nvnc_fb_map(struct nvnc_fb* fb);
-void nvnc_fb_unmap(struct nvnc_fb* fb);
+void resample_now(struct nvnc_fb* dst, struct nvnc_fb* src,
+		struct pixman_region16* damage);
