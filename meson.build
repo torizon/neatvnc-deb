@@ -1,7 +1,7 @@
 project(
 	'neatvnc',
 	'c',
-	version: '0.4.0',
+	version: '0.5.1',
 	license: 'ISC',
 	default_options: [
 		'c_std=gnu11',
@@ -34,6 +34,8 @@ if git.found()
 	endif
 endif
 
+libdrm_inc = dependency('libdrm').partial_dependency(compile_args: true)
+
 add_project_arguments(c_args, language: 'c')
 
 cc = meson.get_compiler('c')
@@ -44,6 +46,12 @@ pixman = dependency('pixman-1')
 libturbojpeg = dependency('libturbojpeg', required: get_option('jpeg'))
 gnutls = dependency('gnutls', required: get_option('tls'))
 zlib = dependency('zlib')
+gbm = dependency('gbm', required: get_option('gbm'))
+libdrm = dependency('libdrm', required: get_option('h264'))
+
+libavcodec = dependency('libavcodec', required: get_option('h264'))
+libavfilter = dependency('libavfilter', required: get_option('h264'))
+libavutil = dependency('libavutil', required: get_option('h264'))
 
 aml_project = subproject('aml', required: false)
 if aml_project.found()
@@ -60,14 +68,21 @@ sources = [
 	'src/zrle.c',
 	'src/raw-encoding.c',
 	'src/pixels.c',
-	'src/damage.c',
 	'src/fb.c',
+	'src/fb_pool.c',
 	'src/rcbuf.c',
 	'src/stream.c',
 	'src/display.c',
 	'src/tight.c',
 	'src/enc-util.c',
 	'src/qnum-to-evdev.c',
+	'src/resampler.c',
+	'src/transform-util.c',
+	'src/damage-refinery.c',
+	'src/murmurhash.c',
+	'src/encoder.c',
+	'src/cursor.c',
+	'src/logging.c',
 ]
 
 dependencies = [
@@ -75,6 +90,7 @@ dependencies = [
 	pixman,
 	aml,
 	zlib,
+	libdrm_inc,
 ]
 
 config = configuration_data()
@@ -91,6 +107,21 @@ endif
 
 if host_system == 'linux' and get_option('systemtap') and cc.has_header('sys/sdt.h')
 	config.set('HAVE_USDT', true)
+endif
+
+if gbm.found()
+	dependencies += gbm
+	config.set('HAVE_GBM', true)
+endif
+
+if libavutil.found()
+	config.set('HAVE_LIBAVUTIL', true)
+endif
+
+if gbm.found() and libdrm.found() and libavcodec.found() and libavfilter.found() and libavutil.found()
+	sources += [ 'src/h264-encoder.c', 'src/open-h264.c' ]
+	dependencies += [libdrm, libavcodec, libavfilter, libavutil]
+	config.set('ENABLE_OPEN_H264', true)
 endif
 
 configure_file(
@@ -118,6 +149,10 @@ endif
 
 if get_option('benchmarks')
 	subdir('bench')
+endif
+
+if get_option('tests')
+	subdir('test')
 endif
 
 install_headers('include/neatvnc.h')

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 - 2020 Andri Yngvason
+ * Copyright (c) 2019 - 2022 Andri Yngvason
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -16,11 +16,12 @@
 
 #include "rfb-proto.h"
 #include "vec.h"
-#include "zrle.h"
 #include "neatvnc.h"
 #include "pixels.h"
 #include "fb.h"
 #include "enc-util.h"
+#include "encoder.h"
+#include "rcbuf.h"
 
 #include <stdint.h>
 #include <unistd.h>
@@ -29,10 +30,36 @@
 #include <assert.h>
 #include <pixman.h>
 #include <zlib.h>
+#include <aml.h>
 
 #define TILE_LENGTH 64
 
 #define UDIV_UP(a, b) (((a) + (b) - 1) / (b))
+
+struct encoder* zrle_encoder_new(void);
+
+struct zrle_encoder {
+	struct encoder encoder;
+
+	struct rfb_pixel_format output_format;
+
+	struct nvnc_fb* current_fb;
+	struct pixman_region16 current_damage;
+
+	struct rcbuf *current_result;
+
+	z_stream zs;
+
+	struct aml_work* work;
+};
+
+struct encoder_impl encoder_impl_zrle;
+
+static inline struct zrle_encoder* zrle_encoder(struct encoder* encoder)
+{
+	assert(encoder->impl == &encoder_impl_zrle);
+	return (struct zrle_encoder*)encoder;
+}
 
 static inline int find_colour_in_palette(uint32_t* palette, int len,
                                          uint32_t colour)
@@ -200,7 +227,7 @@ static int zrle_deflate(struct vec* dst, const struct vec* src, z_stream* zs,
 	return 0;
 }
 
-static int zrle_encode_box(struct vec* out,
+static int zrle_encode_box(struct zrle_encoder* self, struct vec* out,
                            const struct rfb_pixel_format* dst_fmt,
                            const struct nvnc_fb* fb,
                            const struct rfb_pixel_format* src_fmt, int x, int y,
@@ -210,6 +237,9 @@ static int zrle_encode_box(struct vec* out,
 	int bytes_per_cpixel = calc_bytes_per_cpixel(dst_fmt);
 	struct vec in;
 
+	uint16_t x_pos = self->encoder.x_pos;
+	uint16_t y_pos = self->encoder.y_pos;
+
 	uint32_t* tile = malloc(TILE_LENGTH * TILE_LENGTH * 4);
 	if (!tile)
 		goto failure;
@@ -217,7 +247,8 @@ static int zrle_encode_box(struct vec* out,
 	if (vec_init(&in, 1 + bytes_per_cpixel * TILE_LENGTH * TILE_LENGTH) < 0)
 		goto failure;
 
-	r = encode_rect_head(out, RFB_ENCODING_ZRLE, x, y, width, height);
+	r = encode_rect_head(out, RFB_ENCODING_ZRLE, x_pos + x, y_pos + y,
+			width, height);
 	if (r < 0)
 		goto failure;
 
@@ -261,13 +292,14 @@ failure:
 #undef CHUNK
 }
 
-int zrle_encode_frame(z_stream* zs, struct vec* dst,
-                      const struct rfb_pixel_format* dst_fmt,
-                      const struct nvnc_fb* src,
-                      const struct rfb_pixel_format* src_fmt,
-                      struct pixman_region16* region)
+static int zrle_encode_frame(struct zrle_encoder* self, z_stream* zs,
+		struct vec* dst, const struct rfb_pixel_format* dst_fmt,
+		struct nvnc_fb* src, const struct rfb_pixel_format* src_fmt,
+		struct pixman_region16* region)
 {
 	int rc = -1;
+
+	self->encoder.n_rects = 0;
 
 	int n_rects = 0;
 	struct pixman_box16* box = pixman_region_rectangles(region, &n_rects);
@@ -276,7 +308,7 @@ int zrle_encode_frame(z_stream* zs, struct vec* dst,
 		n_rects = 1;
 	}
 
-	rc = encode_rect_count(dst, n_rects);
+	rc = nvnc_fb_map(src);
 	if (rc < 0)
 		return -1;
 
@@ -286,11 +318,141 @@ int zrle_encode_frame(z_stream* zs, struct vec* dst,
 		int box_width = box[i].x2 - x;
 		int box_height = box[i].y2 - y;
 
-		rc = zrle_encode_box(dst, dst_fmt, src, src_fmt, x, y,
-		                     src->width, box_width, box_height, zs);
+		rc = zrle_encode_box(self, dst, dst_fmt, src, src_fmt, x, y,
+		                     src->stride, box_width, box_height, zs);
 		if (rc < 0)
 			return -1;
 	}
 
+	self->encoder.n_rects = n_rects;
 	return 0;
 }
+
+static void zrle_encoder_do_work(void* obj)
+{
+	struct zrle_encoder* self = aml_get_userdata(obj);
+	int rc;
+
+	struct nvnc_fb* fb = self->current_fb;
+	assert(fb);
+
+	// TODO: Calculate the ideal buffer size based on the size of the
+	// damaged area.
+	size_t buffer_size = nvnc_fb_get_stride(fb) * nvnc_fb_get_height(fb) *
+		nvnc_fb_get_pixel_size(fb);
+
+	struct vec dst;
+	rc = vec_init(&dst, buffer_size);
+	assert(rc == 0);
+
+	struct rfb_pixel_format src_fmt;
+	rc = rfb_pixfmt_from_fourcc(&src_fmt, nvnc_fb_get_fourcc_format(fb));
+	assert(rc == 0);
+
+	rc = zrle_encode_frame(self, &self->zs, &dst, &self->output_format, fb,
+			&src_fmt, &self->current_damage);
+	assert(rc == 0);
+
+	self->current_result = rcbuf_new(dst.data, dst.len);
+	assert(self->current_result);
+}
+
+static void zrle_encoder_on_done(void* obj)
+{
+	struct zrle_encoder* self = aml_get_userdata(obj);
+
+	assert(self->current_result);
+
+	uint64_t pts = nvnc_fb_get_pts(self->current_fb);
+	nvnc_fb_unref(self->current_fb);
+	self->current_fb = NULL;
+
+	pixman_region_clear(&self->current_damage);
+
+	struct rcbuf* result = self->current_result;
+	self->current_result = NULL;
+
+	aml_unref(self->work);
+	self->work = NULL;
+
+	encoder_finish_frame(&self->encoder, result, pts);
+
+	rcbuf_unref(result);
+}
+
+struct encoder* zrle_encoder_new(void)
+{
+	struct zrle_encoder* self = calloc(1, sizeof(*self));
+	if (!self)
+		return NULL;
+
+	self->encoder.impl = &encoder_impl_zrle;
+
+	int rc = deflateInit2(&self->zs,
+			/* compression level: */ 1,
+			/*            method: */ Z_DEFLATED,
+			/*       window bits: */ 15,
+			/*         mem level: */ 9,
+			/*          strategy: */ Z_DEFAULT_STRATEGY);
+	if (rc != Z_OK)
+		goto deflate_failure;
+
+	pixman_region_init(&self->current_damage);
+
+	return (struct encoder*)self;
+
+deflate_failure:
+	free(self);
+	return NULL;
+}
+
+static void zrle_encoder_destroy(struct encoder* encoder)
+{
+	struct zrle_encoder* self = zrle_encoder(encoder);
+	pixman_region_fini(&self->current_damage);
+	deflateEnd(&self->zs);
+	if (self->work)
+		aml_unref(self->work);
+	free(self);
+}
+
+static void zrle_encoder_set_output_format(struct encoder* encoder,
+		const struct rfb_pixel_format* pixfmt)
+{
+	struct zrle_encoder* self = zrle_encoder(encoder);
+	memcpy(&self->output_format, pixfmt, sizeof(self->output_format));
+}
+
+static int zrle_encoder_encode(struct encoder* encoder, struct nvnc_fb* fb,
+		struct pixman_region16* damage)
+{
+	struct zrle_encoder* self = zrle_encoder(encoder);
+
+	assert(!self->current_fb);
+
+	self->work = aml_work_new(zrle_encoder_do_work, zrle_encoder_on_done,
+			self, NULL);
+	if (!self->work)
+		return -1;
+
+	self->current_fb = fb;
+	nvnc_fb_ref(self->current_fb);
+	pixman_region_copy(&self->current_damage, damage);
+
+	int rc = aml_start(aml_get_default(), self->work);
+	if (rc < 0) {
+		aml_unref(self->work);
+		self->work = NULL;
+		pixman_region_clear(&self->current_damage);
+		nvnc_fb_unref(self->current_fb);
+		self->current_fb = NULL;
+	}
+
+	return rc;
+}
+
+struct encoder_impl encoder_impl_zrle = {
+	.destroy = zrle_encoder_destroy,
+	.set_output_format = zrle_encoder_set_output_format,
+	.encode = zrle_encoder_encode,
+};

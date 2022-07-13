@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 - 2022 Andri Yngvason
+ * Copyright (c) 2020 - 2021 Andri Yngvason
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -16,40 +16,24 @@
 
 #pragma once
 
-#include <unistd.h>
 #include <stdint.h>
-#include <stdatomic.h>
-#include <stdbool.h>
 
-#include "neatvnc.h"
-#include "common.h"
+struct pixman_region16;
+struct nvnc_fb;
 
-struct gbm_bo;
-
-struct nvnc_fb {
-	struct nvnc_common common;
-	enum nvnc_fb_type type;
-	int ref;
-	int hold_count;
-	nvnc_fb_release_fn on_release;
-	void* release_context;
-	bool is_external;
-	uint16_t width;
-	uint16_t height;
-	uint32_t fourcc_format;
-	enum nvnc_transform transform;
-	uint64_t pts; // in micro seconds
-
-	/* main memory buffer attributes */
-	void* addr;
-	int32_t stride;
-
-	/* dmabuf attributes */
-	struct gbm_bo* bo;
-	void* bo_map_handle;
+struct damage_refinery {
+	uint32_t* hashes;
+	uint32_t width;
+	uint32_t height;
 };
 
-void nvnc_fb_hold(struct nvnc_fb* fb);
-void nvnc_fb_release(struct nvnc_fb* fb);
-int nvnc_fb_map(struct nvnc_fb* fb);
-void nvnc_fb_unmap(struct nvnc_fb* fb);
+int damage_refinery_init(struct damage_refinery* self, uint32_t width,
+		uint32_t height);
+int damage_refinery_resize(struct damage_refinery* self, uint32_t width,
+		uint32_t height);
+void damage_refinery_destroy(struct damage_refinery* self);
+
+void damage_refine(struct damage_refinery* self,
+		struct pixman_region16* refined, 
+		struct pixman_region16* hint,
+		struct nvnc_fb* buffer);

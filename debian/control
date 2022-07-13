@@ -2,7 +2,7 @@ Source: neatvnc
 Priority: optional
 Section: libs
 Maintainer: Boyuan Yang <byang@debian.org>
-Standards-Version: 4.6.0
+Standards-Version: 4.6.1
 Build-Depends:
  debhelper-compat (= 13),
  gnutls-dev,
