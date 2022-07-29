@@ -36,7 +36,7 @@ Comment:
 
 Files:
  include/murmurhash.h
- src/murmurhsah.c
+ src/murmurhash.c
 Copyright: 2014 Joseph Werle
 License: Expat
 
