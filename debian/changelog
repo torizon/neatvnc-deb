@@ -1,3 +1,9 @@
+neatvnc (0.5.3+dfsg-1) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Boyuan Yang <byang@debian.org>  Tue, 30 Aug 2022 16:52:56 -0400
+
 neatvnc (0.5.1+dfsg-2) unstable; urgency=high
 
   * Update copyright file with missing info. (Closes: #1015155)
