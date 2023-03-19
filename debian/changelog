@@ -1,3 +1,10 @@
+neatvnc (0.5.4+dfsg-2~exp1) experimental; urgency=medium
+
+  * debian/rules: Enable post-build tests per Gentoo maintainer's
+    suggestion.
+
+ -- Boyuan Yang <byang@debian.org>  Sat, 18 Mar 2023 21:53:27 -0400
+
 neatvnc (0.5.4+dfsg-1) unstable; urgency=medium
 
   * New upstream release.
