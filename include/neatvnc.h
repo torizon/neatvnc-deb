@@ -62,6 +62,8 @@ enum nvnc_button_mask {
 	NVNC_BUTTON_RIGHT = 1 << 2,
 	NVNC_SCROLL_UP = 1 << 3,
 	NVNC_SCROLL_DOWN = 1 << 4,
+	NVNC_SCROLL_LEFT = 1 << 5,
+	NVNC_SCROLL_RIGHT = 1 << 6,
 };
 
 enum nvnc_fb_type {
@@ -108,8 +110,11 @@ typedef void (*nvnc_client_fn)(struct nvnc_client*);
 typedef void (*nvnc_damage_fn)(struct pixman_region16* damage, void* userdata);
 typedef bool (*nvnc_auth_fn)(const char* username, const char* password,
                              void* userdata);
-typedef void (*nvnc_cut_text_fn)(struct nvnc*, const char* text, uint32_t len);
+typedef void (*nvnc_cut_text_fn)(struct nvnc_client*, const char* text,
+		uint32_t len);
 typedef void (*nvnc_fb_release_fn)(struct nvnc_fb*, void* context);
+typedef struct nvnc_fb* (*nvnc_fb_alloc_fn)(uint16_t width, uint16_t height,
+		uint32_t format, uint16_t stride);
 typedef void (*nvnc_cleanup_fn)(void* userdata);
 typedef void (*nvnc_log_fn)(const struct nvnc_log_data*, const char* message);
 
@@ -126,6 +131,13 @@ void nvnc_set_userdata(void* self, void* userdata, nvnc_cleanup_fn);
 void* nvnc_get_userdata(const void* self);
 
 struct nvnc* nvnc_client_get_server(const struct nvnc_client* client);
+bool nvnc_client_supports_cursor(const struct nvnc_client* client);
+const char* nvnc_client_get_hostname(const struct nvnc_client* client);
+const char* nvnc_client_get_auth_username(const struct nvnc_client* client);
+
+struct nvnc_client* nvnc_client_first(struct nvnc* self);
+struct nvnc_client* nvnc_client_next(struct nvnc_client* client);
+void nvnc_client_close(struct nvnc_client* client);
 
 void nvnc_set_name(struct nvnc* self, const char* name);
 
@@ -135,7 +147,7 @@ void nvnc_set_pointer_fn(struct nvnc* self, nvnc_pointer_fn);
 void nvnc_set_fb_req_fn(struct nvnc* self, nvnc_fb_req_fn);
 void nvnc_set_new_client_fn(struct nvnc* self, nvnc_client_fn);
 void nvnc_set_client_cleanup_fn(struct nvnc_client* self, nvnc_client_fn fn);
-void nvnc_set_cut_text_receive_fn(struct nvnc* self, nvnc_cut_text_fn fn);
+void nvnc_set_cut_text_fn(struct nvnc*, nvnc_cut_text_fn fn);
 
 bool nvnc_has_auth(void);
 int nvnc_enable_auth(struct nvnc* self, const char* privkey_path,
@@ -172,6 +184,8 @@ struct nvnc_fb_pool* nvnc_fb_pool_new(uint16_t width, uint16_t height,
 				      uint32_t fourcc_format, uint16_t stride);
 bool nvnc_fb_pool_resize(struct nvnc_fb_pool*, uint16_t width, uint16_t height,
 			 uint32_t fourcc_format, uint16_t stride);
+
+void nvnc_fb_pool_set_alloc_fn(struct nvnc_fb_pool*, nvnc_fb_alloc_fn);
 
 void nvnc_fb_pool_ref(struct nvnc_fb_pool*);
 void nvnc_fb_pool_unref(struct nvnc_fb_pool*);

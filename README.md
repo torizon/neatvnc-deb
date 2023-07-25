@@ -12,29 +12,22 @@ neat.
 ## Building
 
 ### Runtime Dependencies
- * pixman
  * aml - https://github.com/any1/aml/
- * zlib
+ * ffmpeg (optional)
+ * gbm (optional)
  * gnutls (optional)
+ * libdrm (optional)
  * libturbojpeg (optional)
+ * pixman
+ * zlib
 
 ### Build Dependencies
+ * libdrm
  * meson
  * pkg-config
- * libdrm
 
 To build just run:
 ```
 meson build
 ninja -C build
 ```
-
-## Client Compatibility
- Name    | ZRLE Encoding | Tight Encoding | Crypto & Auth | SSH Tunneling
----------|---------------|----------------|---------------|--------------
-bVNC     |           Yes |              ? |           Yes |          Yes
-RealVNC  |           Yes |              ? |             ? |            ?
-Remmina  |           Yes |            Yes |             ? |          Yes
-TigerVNC |           Yes |            Yes |           Yes |            ?
-TightVNC |            No |            Yes |             ? |            ?
-UltraVNC |             ? |              ? |             ? |            ?

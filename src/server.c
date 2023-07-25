@@ -26,7 +26,6 @@
 #include "config.h"
 #include "usdt.h"
 #include "encoder.h"
-#include "tight.h"
 #include "enc-util.h"
 #include "cursor.h"
 #include "logging.h"
@@ -74,7 +73,6 @@ static int send_desktop_resize(struct nvnc_client* client, struct nvnc_fb* fb);
 static int send_qemu_key_ext_frame(struct nvnc_client* client);
 static enum rfb_encodings choose_frame_encoding(struct nvnc_client* client,
 		struct nvnc_fb*);
-static enum tight_quality client_get_tight_quality(struct nvnc_client* client);
 static void on_encode_frame_done(struct encoder*, struct rcbuf*, uint64_t pts);
 static bool client_has_encoding(const struct nvnc_client* client,
 		enum rfb_encodings encoding);
@@ -123,8 +121,9 @@ static void client_close(struct nvnc_client* client)
 		client->server->n_damage_clients -=
 			!(client->encoder->impl->flags &
 					ENCODER_IMPL_FLAG_IGNORES_DAMAGE);
+		client->encoder->on_done = NULL;
 	}
-	encoder_destroy(client->encoder);
+	encoder_unref(client->encoder);
 	pixman_region_fini(&client->damage);
 	free(client->cut_text.buffer);
 	free(client);
@@ -148,8 +147,7 @@ static void close_after_write(void* userdata, enum stream_req_status status)
 	struct nvnc_client* client = userdata;
 	nvnc_log(NVNC_LOG_DEBUG, "close_after_write(%p): ref %d", client,
 			client->ref);
-	stream_close(client->net_stream);
-	client_unref(client);
+	nvnc_client_close(client);
 }
 
 static int handle_unsupported_version(struct nvnc_client* client)
@@ -297,8 +295,7 @@ static int on_vencrypt_subtype_message(struct nvnc_client* client)
 
 	if (stream_upgrade_to_tls(client->net_stream, client->server->tls_creds) < 0) {
 		client->state = VNC_CLIENT_STATE_ERROR;
-		stream_close(client->net_stream);
-		client_unref(client);
+		nvnc_client_close(client);
 		return sizeof(*msg);
 	}
 
@@ -331,6 +328,9 @@ static int on_vencrypt_plain_auth_message(struct nvnc_client* client)
 
 	username[MIN(ulen, sizeof(username) - 1)] = '\0';
 	password[MIN(plen, sizeof(password) - 1)] = '\0';
+
+	strncpy(client->username, username, sizeof(client->username));
+	client->username[sizeof(client->username) - 1] = '\0';
 
 	if (server->auth_fn(username, password, server->auth_ud)) {
 		nvnc_log(NVNC_LOG_INFO, "User \"%s\" authenticated", username);
@@ -381,8 +381,7 @@ static void disconnect_all_other_clients(struct nvnc_client* client)
 			nvnc_log(NVNC_LOG_DEBUG,
 					"disconnect other client %p (ref %d)",
 					node, node->ref);
-			stream_close(node->net_stream);
-			client_unref(node);
+			nvnc_client_close(node);
 		}
 
 }
@@ -436,8 +435,7 @@ static void send_server_init_message(struct nvnc_client* client)
 pixfmt_failure:
 	free(msg);
 close:
-	stream_close(client->net_stream);
-	client_unref(client);
+	nvnc_client_close(client);
 }
 
 static int on_init_message(struct nvnc_client* client)
@@ -471,8 +469,7 @@ static int on_client_set_pixel_format(struct nvnc_client* client)
 
 	if (!fmt->true_colour_flag) {
 		/* We don't really know what to do with color maps right now */
-		stream_close(client->net_stream);
-		client_unref(client);
+		nvnc_client_close(client);
 		return 0;
 	}
 
@@ -500,6 +497,8 @@ static int on_client_set_encodings(struct nvnc_client* client)
 	    sizeof(*msg) + n_encodings * 4)
 		return 0;
 
+	client->quality = 10;
+
 	for (size_t i = 0; i < n_encodings; ++i) {
 		enum rfb_encodings encoding = htonl(msg->encodings[i]);
 
@@ -514,27 +513,19 @@ static int on_client_set_encodings(struct nvnc_client* client)
 		case RFB_ENCODING_OPEN_H264:
 		case RFB_ENCODING_CURSOR:
 		case RFB_ENCODING_DESKTOPSIZE:
-		case RFB_ENCODING_JPEG_HIGHQ:
-		case RFB_ENCODING_JPEG_LOWQ:
 		case RFB_ENCODING_QEMU_EXT_KEY_EVENT:
 		case RFB_ENCODING_PTS:
 			client->encodings[n++] = encoding;
 		}
+
+		if (RFB_ENCODING_JPEG_LOWQ <= encoding &&
+				encoding <= RFB_ENCODING_JPEG_HIGHQ)
+			client->quality = encoding - RFB_ENCODING_JPEG_LOWQ;
 	}
 
 	client->n_encodings = n;
 
 	return sizeof(*msg) + 4 * n_encodings;
-}
-
-static void on_encoder_push_done(struct encoder* encoder, struct rcbuf* payload,
-		uint64_t pts)
-{
-	(void)payload;
-	(void)pts;
-
-	struct nvnc_client* client = encoder->userdata;
-	process_fb_update_requests(client);
 }
 
 static void send_cursor_update(struct nvnc_client* client)
@@ -571,10 +562,10 @@ static bool will_send_pts(const struct nvnc_client* client, uint64_t pts)
 	return pts != NVNC_NO_PTS && client_has_encoding(client, RFB_ENCODING_PTS);
 }
 
-static void send_pts_rect(struct nvnc_client* client, uint64_t pts)
+static int send_pts_rect(struct nvnc_client* client, uint64_t pts)
 {
 	if (!will_send_pts(client, pts))
-		return;
+		return 0;
 
 	uint8_t buf[sizeof(struct rfb_server_fb_rect) + 8] = { 0 };
 	struct rfb_server_fb_rect* head = (struct rfb_server_fb_rect*)buf;
@@ -582,7 +573,7 @@ static void send_pts_rect(struct nvnc_client* client, uint64_t pts)
 	uint64_t* msg_pts = (uint64_t*)&buf[sizeof(struct rfb_server_fb_rect)];
 	*msg_pts = nvnc__htonll(pts);
 
-	stream_write(client->net_stream, buf, sizeof(buf), NULL, NULL);
+	return stream_write(client->net_stream, buf, sizeof(buf), NULL, NULL);
 }
 
 static const char* encoding_to_string(enum rfb_encodings encoding)
@@ -658,18 +649,13 @@ static void process_fb_update_requests(struct nvnc_client* client)
 			server->n_damage_clients -=
 				!(client->encoder->impl->flags &
 						ENCODER_IMPL_FLAG_IGNORES_DAMAGE);
+			client->encoder->on_done = NULL;
 		}
-		encoder_destroy(client->encoder);
+		encoder_unref(client->encoder);
 		client->encoder = encoder_new(encoding, width, height);
 		if (!client->encoder) {
 			nvnc_log(NVNC_LOG_ERROR, "Failed to allocate new encoder");
 			return;
-		}
-
-		if (encoder_get_kind(client->encoder) == ENCODER_KIND_PUSH_PULL)
-		{
-			client->encoder->on_done = on_encoder_push_done;
-			client->encoder->userdata = client;
 		}
 
 		server->n_damage_clients +=
@@ -680,69 +666,39 @@ static void process_fb_update_requests(struct nvnc_client* client)
 				encoding_to_string(encoding), client);
 	}
 
-	enum encoder_kind kind = encoder_get_kind(client->encoder);
-	if (kind == ENCODER_KIND_PUSH_PULL) {
-		uint64_t pts = NVNC_NO_PTS;
-		struct rcbuf* buf = encoder_pull(client->encoder, &pts);
-		if (!buf)
-			return;
+	/* The client's damage is exchanged for an empty one */
+	struct pixman_region16 damage = client->damage;
+	pixman_region_init(&client->damage);
 
-		DTRACE_PROBE2(neatvnc, process_fb_update_requests__pull, client,
-				pts);
+	client->is_updating = true;
+	client->current_fb = fb;
+	nvnc_fb_hold(fb);
+	nvnc_fb_ref(fb);
 
-		int n_rects = client->encoder->n_rects;
-		n_rects += will_send_pts(client, pts) ? 1 : 0;
+	client_ref(client);
 
-		struct rfb_server_fb_update_msg update_msg = {
-			.type = RFB_SERVER_TO_CLIENT_FRAMEBUFFER_UPDATE,
-			.n_rects = htons(n_rects),
-		};
-		stream_write(client->net_stream, &update_msg,
-				sizeof(update_msg), NULL, NULL);
+	encoder_set_quality(client->encoder, client->quality);
+	encoder_set_output_format(client->encoder, &client->pixfmt);
 
-		send_pts_rect(client, pts);
+	client->encoder->on_done = on_encode_frame_done;
+	client->encoder->userdata = client;
 
-		stream_send(client->net_stream, buf, NULL, NULL);
-		pixman_region_clear(&client->damage);
+	DTRACE_PROBE2(neatvnc, process_fb_update_requests__encode,
+			client, fb->pts);
+
+	if (encoder_encode(client->encoder, fb, &damage) >= 0) {
 		--client->n_pending_requests;
-	} else if (kind == ENCODER_KIND_REGULAR) {
-		/* The client's damage is exchanged for an empty one */
-		struct pixman_region16 damage = client->damage;
-		pixman_region_init(&client->damage);
-
-		client->is_updating = true;
-		client->current_fb = fb;
-		nvnc_fb_hold(fb);
-		nvnc_fb_ref(fb);
-
-		client_ref(client);
-
-		int q = client_get_tight_quality(client);
-		encoder_set_tight_quality(client->encoder, q);
-		encoder_set_output_format(client->encoder, &client->pixfmt);
-
-		client->encoder->on_done = on_encode_frame_done;
-		client->encoder->userdata = client;
-
-		DTRACE_PROBE2(neatvnc, process_fb_update_requests__encode,
-				client, fb->pts);
-
-		if (encoder_encode(client->encoder, fb, &damage) >= 0) {
-			--client->n_pending_requests;
-		} else {
-			nvnc_log(NVNC_LOG_ERROR, "Failed to encode current frame");
-			client_unref(client);
-			client->is_updating = false;
-			assert(client->current_fb);
-			nvnc_fb_release(client->current_fb);
-			nvnc_fb_unref(client->current_fb);
-			client->current_fb = NULL;
-		}
-
-		pixman_region_fini(&damage);
 	} else {
-		abort();
+		nvnc_log(NVNC_LOG_ERROR, "Failed to encode current frame");
+		client_unref(client);
+		client->is_updating = false;
+		assert(client->current_fb);
+		nvnc_fb_release(client->current_fb);
+		nvnc_fb_unref(client->current_fb);
+		client->current_fb = NULL;
 	}
+
+	pixman_region_fini(&damage);
 }
 
 static int on_client_fb_update_request(struct nvnc_client* client)
@@ -847,8 +803,7 @@ static int on_client_qemu_event(struct nvnc_client* client)
 
 	nvnc_log(NVNC_LOG_WARNING, "Got uninterpretable qemu message from client: %p (ref %d)",
 	          client, client->ref);
-	stream_close(client->net_stream);
-	client_unref(client);
+	nvnc_client_close(client);
 	return 0;
 }
 
@@ -891,8 +846,6 @@ void nvnc_send_cut_text(struct nvnc* server, const char* text, uint32_t len)
 
 static int on_client_cut_text(struct nvnc_client* client)
 {
-	struct nvnc* server = client->server;
-	nvnc_cut_text_fn fn = server->cut_text_fn;
 	struct rfb_cut_text_msg* msg =
 	        (struct rfb_cut_text_msg*)(client->msg_buffer +
 	                                   client->buffer_index);
@@ -909,16 +862,16 @@ static int on_client_cut_text(struct nvnc_client* client)
 	if (length > max_length) {
 		nvnc_log(NVNC_LOG_ERROR, "Copied text length (%d) is greater than max supported length (%d)",
 			length, max_length);
-		stream_close(client->net_stream);
-		client_unref(client);
+		nvnc_client_close(client);
 		return 0;
 	}
 
 	size_t msg_size = sizeof(*msg) + length;
 
 	if (msg_size <= left_to_process) {
+		nvnc_cut_text_fn fn = client->server->cut_text_fn;
 		if (fn)
-			fn(server, msg->text, length);
+			fn(client, msg->text, length);
 
 		return msg_size;
 	}
@@ -928,8 +881,7 @@ static int on_client_cut_text(struct nvnc_client* client)
 	client->cut_text.buffer = malloc(length);
 	if (!client->cut_text.buffer) {
 		nvnc_log(NVNC_LOG_ERROR, "OOM: %m");
-		stream_close(client->net_stream);
-		client_unref(client);
+		nvnc_client_close(client);
 		return 0;
 	}
 
@@ -945,9 +897,6 @@ static int on_client_cut_text(struct nvnc_client* client)
 
 static void process_big_cut_text(struct nvnc_client* client)
 {
-	struct nvnc* server = client->server;
-	nvnc_cut_text_fn fn = server->cut_text_fn;
-
 	assert(client->cut_text.length > client->cut_text.index);
 
 	void* start = client->cut_text.buffer + client->cut_text.index;
@@ -964,8 +913,7 @@ static void process_big_cut_text(struct nvnc_client* client)
 		if (errno != EAGAIN) {
 			nvnc_log(NVNC_LOG_INFO, "Client connection error: %p (ref %d)",
 				  client, client->ref);
-			stream_close(client->net_stream);
-			client_unref(client);
+			nvnc_client_close(client);
 		}
 
 		return;
@@ -976,8 +924,9 @@ static void process_big_cut_text(struct nvnc_client* client)
 	if (client->cut_text.index != client->cut_text.length)
 		return;
 
+	nvnc_cut_text_fn fn = client->server->cut_text_fn;
 	if (fn)
-		fn(server, client->cut_text.buffer, client->cut_text.length);
+		fn(client, client->cut_text.buffer, client->cut_text.length);
 
 	free(client->cut_text.buffer);
 	client->cut_text.buffer = NULL;
@@ -1010,8 +959,7 @@ static int on_client_message(struct nvnc_client* client)
 
 	nvnc_log(NVNC_LOG_WARNING, "Got uninterpretable message from client: %p (ref %d)",
 	          client, client->ref);
-	stream_close(client->net_stream);
-	client_unref(client);
+	nvnc_client_close(client);
 	return 0;
 }
 
@@ -1038,7 +986,7 @@ static int try_read_client_message(struct nvnc_client* client)
 		return on_client_message(client);
 	}
 
-	abort();
+	nvnc_log(NVNC_LOG_PANIC, "Invalid client state");
 	return 0;
 }
 
@@ -1050,8 +998,7 @@ static void on_client_event(struct stream* stream, enum stream_event event)
 
 	if (event == STREAM_EVENT_REMOTE_CLOSED) {
 		nvnc_log(NVNC_LOG_INFO, "Client %p (%d) hung up", client, client->ref);
-		stream_close(stream);
-		client_unref(client);
+		nvnc_client_close(client);
 		return;
 	}
 
@@ -1073,8 +1020,7 @@ static void on_client_event(struct stream* stream, enum stream_event event)
 		if (errno != EAGAIN) {
 			nvnc_log(NVNC_LOG_INFO, "Client connection error: %p (ref %d)",
 				  client, client->ref);
-			stream_close(stream);
-			client_unref(client);
+			nvnc_client_close(client);
 		}
 
 		return;
@@ -1099,6 +1045,24 @@ static void on_client_event(struct stream* stream, enum stream_event event)
 	client->buffer_index = 0;
 }
 
+static void record_peer_hostname(int fd, struct nvnc_client* client)
+{
+	struct sockaddr_storage storage;
+	struct sockaddr* peer = (struct sockaddr*)&storage;
+	socklen_t peerlen = sizeof(storage);
+	if (getpeername(fd, peer, &peerlen) == 0) {
+		if (peer->sa_family == AF_UNIX) {
+			snprintf(client->hostname, sizeof(client->hostname),
+					"unix domain socket");
+		} else {
+			getnameinfo(peer, peerlen,
+					client->hostname, sizeof(client->hostname),
+					NULL, 0, // no need for port
+					0);
+		}
+	}
+}
+
 static void on_connection(void* obj)
 {
 	struct nvnc* server = aml_get_userdata(obj);
@@ -1109,6 +1073,7 @@ static void on_connection(void* obj)
 
 	client->ref = 1;
 	client->server = server;
+	client->quality = 10; /* default to lossless */
 
 	int fd = accept(server->fd, NULL, 0);
 	if (fd < 0) {
@@ -1118,6 +1083,8 @@ static void on_connection(void* obj)
 
 	int one = 1;
 	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+	record_peer_hostname(fd, client);
 
 	client->net_stream = stream_new(fd, on_client_event, client);
 	if (!client->net_stream) {
@@ -1144,7 +1111,7 @@ static void on_connection(void* obj)
 
 	client->state = VNC_CLIENT_STATE_WAITING_FOR_VERSION;
 
-	nvnc_log(NVNC_LOG_INFO, "New client connection: %p (ref %d)", client, client->ref);
+	nvnc_log(NVNC_LOG_INFO, "New client connection from %s: %p (ref %d)", client->hostname, client, client->ref);
 
 	return;
 
@@ -1156,6 +1123,21 @@ stream_failure:
 	close(fd);
 accept_failure:
 	free(client);
+}
+
+static void sockaddr_to_string(char* dst, size_t sz, const struct sockaddr* addr)
+{
+	struct sockaddr_in *sa_in = (struct sockaddr_in*)addr;
+	struct sockaddr_in6 *sa_in6 = (struct sockaddr_in6*)addr;
+
+	switch (addr->sa_family) {
+	case AF_INET:
+		inet_ntop(addr->sa_family, &sa_in->sin_addr, dst, sz);
+		break;
+	case AF_INET6:
+		inet_ntop(addr->sa_family, &sa_in6->sin6_addr, dst, sz);
+		break;
+	}
 }
 
 static int bind_address_tcp(const char* name, int port)
@@ -1171,23 +1153,37 @@ static int bind_address_tcp(const char* name, int port)
 	snprintf(service, sizeof(service), "%d", port);
 
 	int rc = getaddrinfo(name, service, &hints, &result);
-	if (rc != 0)
+	if (rc != 0) {
+		nvnc_log(NVNC_LOG_ERROR, "Failed to get address info: %s",
+				gai_strerror(rc));
 		return -1;
+	}
 
 	int fd = -1;
 
 	for (struct addrinfo* p = result; p != NULL; p = p->ai_next) {
+		char ai_str[256] = { 0 };
+		sockaddr_to_string(ai_str, sizeof(ai_str), p->ai_addr);
+		nvnc_log(NVNC_LOG_DEBUG, "Trying address: %s", ai_str);
+
 		fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-		if (fd < 0)
+		if (fd < 0) {
+			nvnc_log(NVNC_LOG_DEBUG, "Failed to create socket: %m");
 			continue;
+		}
 
 		int one = 1;
-		if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(int)) < 0)
+		if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(int)) < 0) {
+			nvnc_log(NVNC_LOG_DEBUG, "Failed to set socket options: %m");
 			goto failure;
+		}
 
-		if (bind(fd, p->ai_addr, p->ai_addrlen) == 0)
+		if (bind(fd, p->ai_addr, p->ai_addrlen) == 0) {
+			nvnc_log(NVNC_LOG_DEBUG, "Successfully bound to address");
 			break;
+		}
 
+		nvnc_log(NVNC_LOG_DEBUG, "Failed to bind to address: %m");
 failure:
 		close(fd);
 		fd = -1;
@@ -1230,8 +1226,8 @@ static int bind_address(const char* name, uint16_t port, enum addrtype type)
 		return bind_address_unix(name);
 	}
 
-	nvnc_log(NVNC_LOG_ERROR, "unknown socket address type");
-	abort();
+	nvnc_log(NVNC_LOG_PANIC, "Unknown socket address type");
+	return -1;
 }
 
 static struct nvnc* open_common(const char* address, uint16_t port, enum addrtype type)
@@ -1314,6 +1310,9 @@ void nvnc_close(struct nvnc* self)
 	if (self->display)
 		nvnc_display_unref(self->display);
 
+	if (self->cursor.buffer)
+		nvnc_fb_unref(self->cursor.buffer);
+
 	struct nvnc_client* tmp;
 	LIST_FOREACH_SAFE (client, &self->clients, link, tmp)
 		client_unref(client);
@@ -1333,9 +1332,8 @@ void nvnc_close(struct nvnc* self)
 	free(self);
 }
 
-static void on_write_frame_done(void* userdata, enum stream_req_status status)
+static void complete_fb_update(struct nvnc_client* client)
 {
-	struct nvnc_client* client = userdata;
 	client->is_updating = false;
 	assert(client->current_fb);
 	nvnc_fb_release(client->current_fb);
@@ -1343,6 +1341,13 @@ static void on_write_frame_done(void* userdata, enum stream_req_status status)
 	client->current_fb = NULL;
 	process_fb_update_requests(client);
 	client_unref(client);
+	DTRACE_PROBE2(neatvnc, update_fb_done, client, pts);
+}
+
+static void on_write_frame_done(void* userdata, enum stream_req_status status)
+{
+	struct nvnc_client* client = userdata;
+	complete_fb_update(client);
 }
 
 static enum rfb_encodings choose_frame_encoding(struct nvnc_client* client,
@@ -1368,22 +1373,6 @@ static enum rfb_encodings choose_frame_encoding(struct nvnc_client* client,
 	return RFB_ENCODING_RAW;
 }
 
-static enum tight_quality client_get_tight_quality(struct nvnc_client* client)
-{
-	if (client->pixfmt.bits_per_pixel != 16 &&
-	    client->pixfmt.bits_per_pixel != 32)
-		return TIGHT_QUALITY_LOSSLESS;
-
-	for (size_t i = 0; i < client->n_encodings; ++i)
-		switch (client->encodings[i]) {
-		case RFB_ENCODING_JPEG_HIGHQ: return TIGHT_QUALITY_HIGH;
-		case RFB_ENCODING_JPEG_LOWQ: return TIGHT_QUALITY_LOW;
-		default:;
-		}
-
-	return TIGHT_QUALITY_LOSSLESS;
-}
-
 static bool client_has_encoding(const struct nvnc_client* client,
 		enum rfb_encodings encoding)
 {
@@ -1399,31 +1388,32 @@ static void finish_fb_update(struct nvnc_client* client, struct rcbuf* payload,
 {
 	client_ref(client);
 
-	if (client->net_stream->state != STREAM_STATE_CLOSED) {
-		DTRACE_PROBE2(neatvnc, send_fb_start, client, pts);
-		n_rects += will_send_pts(client, pts) ? 1 : 0;
-		struct rfb_server_fb_update_msg update_msg = {
-			.type = RFB_SERVER_TO_CLIENT_FRAMEBUFFER_UPDATE,
-			.n_rects = htons(n_rects),
-		};
-		stream_write(client->net_stream, &update_msg,
-				sizeof(update_msg), NULL, NULL);
-		send_pts_rect(client, pts);
-		rcbuf_ref(payload);
-		stream_send(client->net_stream, payload, on_write_frame_done,
-		            client);
-		DTRACE_PROBE2(neatvnc, send_fb_done, client, pts);
-	} else {
-		client->is_updating = false;
-		assert(client->current_fb);
-		nvnc_fb_release(client->current_fb);
-		nvnc_fb_unref(client->current_fb);
-		client->current_fb = NULL;
-		process_fb_update_requests(client);
-		client_unref(client);
-	}
+	if (client->net_stream->state == STREAM_STATE_CLOSED)
+		goto complete;
 
-	DTRACE_PROBE2(neatvnc, update_fb_done, client, pts);
+	DTRACE_PROBE2(neatvnc, send_fb_start, client, pts);
+	n_rects += will_send_pts(client, pts) ? 1 : 0;
+	struct rfb_server_fb_update_msg update_msg = {
+		.type = RFB_SERVER_TO_CLIENT_FRAMEBUFFER_UPDATE,
+		.n_rects = htons(n_rects),
+	};
+	if (stream_write(client->net_stream, &update_msg,
+			sizeof(update_msg), NULL, NULL) < 0)
+		goto complete;
+
+	if (send_pts_rect(client, pts) < 0)
+		goto complete;
+
+	rcbuf_ref(payload);
+	if (stream_send(client->net_stream, payload,
+				on_write_frame_done, client) < 0)
+		goto complete;
+
+	DTRACE_PROBE2(neatvnc, send_fb_done, client, pts);
+	return;
+
+complete:
+	complete_fb_update(client);
 }
 
 static void on_encode_frame_done(struct encoder* encoder, struct rcbuf* result,
@@ -1440,15 +1430,15 @@ static int send_desktop_resize(struct nvnc_client* client, struct nvnc_fb* fb)
 {
 	if (!client_has_encoding(client, RFB_ENCODING_DESKTOPSIZE)) {
 		nvnc_log(NVNC_LOG_ERROR, "Client does not support desktop resizing. Closing connection...");
-		stream_close(client->net_stream);
-		client_unref(client);
+		nvnc_client_close(client);
 		return -1;
 	}
 
 	client->known_width = fb->width;
 	client->known_height = fb->height;
 
-	encoder_resize(client->encoder, fb->width, fb->height);
+	if (client->encoder)
+		encoder_resize(client->encoder, fb->width, fb->height);
 
 	pixman_region_union_rect(&client->damage, &client->damage, 0, 0,
 			fb->width, fb->height);
@@ -1550,7 +1540,7 @@ void nvnc_set_client_cleanup_fn(struct nvnc_client* self, nvnc_client_fn fn)
 }
 
 EXPORT
-void nvnc_set_cut_text_receive_fn(struct nvnc* self, nvnc_cut_text_fn fn)
+void nvnc_set_cut_text_fn(struct nvnc* self, nvnc_cut_text_fn fn)
 {
 	self->cut_text_fn = fn;
 }
@@ -1559,8 +1549,7 @@ EXPORT
 void nvnc_add_display(struct nvnc* self, struct nvnc_display* display)
 {
 	if (self->display) {
-		nvnc_log(NVNC_LOG_ERROR, "Multiple displays are not implemented. Aborting!");
-		abort();
+		nvnc_log(NVNC_LOG_PANIC, "Multiple displays are not implemented. Aborting!");
 	}
 
 	display->server = self;
@@ -1582,6 +1571,50 @@ EXPORT
 struct nvnc* nvnc_client_get_server(const struct nvnc_client* client)
 {
 	return client->server;
+}
+
+EXPORT
+const char* nvnc_client_get_hostname(const struct nvnc_client* client) {
+	if (client->hostname[0] == '\0')
+		return NULL;
+	return client->hostname;
+}
+
+EXPORT
+const char* nvnc_client_get_auth_username(const struct nvnc_client* client) {
+	if (client->username[0] == '\0')
+		return NULL;
+	return client->username;
+}
+
+EXPORT
+struct nvnc_client* nvnc_client_first(struct nvnc* self)
+{
+	return LIST_FIRST(&self->clients);
+}
+
+EXPORT
+struct nvnc_client* nvnc_client_next(struct nvnc_client* client)
+{
+	assert(client);
+	return LIST_NEXT(client, link);
+}
+
+EXPORT
+void nvnc_client_close(struct nvnc_client* client)
+{
+	stream_close(client->net_stream);
+	client_unref(client);
+}
+
+EXPORT
+bool nvnc_client_supports_cursor(const struct nvnc_client* client)
+{
+	for (size_t i = 0; i < client->n_encodings; ++i) {
+		if (client->encodings[i] == RFB_ENCODING_CURSOR)
+			return true;
+	}
+	return false;
 }
 
 EXPORT

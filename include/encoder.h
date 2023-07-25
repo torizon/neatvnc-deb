@@ -30,12 +30,6 @@ enum encoder_impl_flags {
 	ENCODER_IMPL_FLAG_IGNORES_DAMAGE = 1 << 0,
 };
 
-enum encoder_kind {
-	ENCODER_KIND_INVALID = 0,
-	ENCODER_KIND_REGULAR,
-	ENCODER_KIND_PUSH_PULL,
-};
-
 struct encoder_impl {
 	enum encoder_impl_flags flags;
 
@@ -43,22 +37,20 @@ struct encoder_impl {
 
 	void (*set_output_format)(struct encoder*,
 			const struct rfb_pixel_format*);
-	void (*set_tight_quality)(struct encoder*, int quality);
+	void (*set_quality)(struct encoder*, int quality);
 
 	int (*resize)(struct encoder*, uint16_t width, uint16_t height);
 
 	int (*encode)(struct encoder*, struct nvnc_fb* fb,
 			struct pixman_region16* damage);
 
-	int (*push)(struct encoder*, struct nvnc_fb* fb,
-			struct pixman_region16* damage);
-	struct rcbuf* (*pull)(struct encoder*, uint64_t* pts);
-
 	void (*request_key_frame)(struct encoder*);
 };
 
 struct encoder {
 	struct encoder_impl* impl;
+
+	int ref;
 
 	uint16_t x_pos;
 	uint16_t y_pos;
@@ -71,23 +63,22 @@ struct encoder {
 
 struct encoder* encoder_new(enum rfb_encodings type, uint16_t width,
 		uint16_t height);
-void encoder_destroy(struct encoder* self);
+void encoder_ref(struct encoder* self);
+void encoder_unref(struct encoder* self);
+
+void encoder_init(struct encoder* self, struct encoder_impl*);
 
 enum rfb_encodings encoder_get_type(const struct encoder* self);
 enum encoder_kind encoder_get_kind(const struct encoder* self);
 
 void encoder_set_output_format(struct encoder* self,
 		const struct rfb_pixel_format*);
-void encoder_set_tight_quality(struct encoder* self, int value);
+void encoder_set_quality(struct encoder* self, int value);
 
 int encoder_resize(struct encoder* self, uint16_t width, uint16_t height);
 
 int encoder_encode(struct encoder* self, struct nvnc_fb* fb,
 		struct pixman_region16* damage);
-
-int encoder_push(struct encoder* self, struct nvnc_fb* fb,
-		struct pixman_region16* damage);
-struct rcbuf* encoder_pull(struct encoder* self, uint64_t* pts);
 
 void encoder_request_key_frame(struct encoder* self);
 

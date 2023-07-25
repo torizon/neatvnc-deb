@@ -25,6 +25,7 @@
 #include <aml.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/socket.h>
 
 #ifdef ENABLE_TLS
 #include <gnutls/gnutls.h>
@@ -123,7 +124,11 @@ static int stream__flush_plain(struct stream* self)
 	if (n_msgs == 0)
 		return 0;
 
-	bytes_sent = writev(self->fd, iov, n_msgs);
+	struct msghdr msghdr = {
+		.msg_iov = iov,
+		.msg_iovlen = n_msgs,
+	};
+	bytes_sent = sendmsg(self->fd, &msghdr, MSG_NOSIGNAL);
 	if (bytes_sent < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK) {
 			stream__poll_rw(self);
@@ -349,7 +354,11 @@ static ssize_t stream__read_plain(struct stream* self, void* dst, size_t size)
 static ssize_t stream__read_tls(struct stream* self, void* dst, size_t size)
 {
 	ssize_t rc = gnutls_record_recv(self->tls_session, dst, size);
-	if (rc >= 0) {
+	if (rc == 0) {
+		stream__remote_closed(self);
+		return rc;
+	}
+	if (rc > 0) {
 		self->bytes_received += rc;
 		return rc;
 	}

@@ -378,6 +378,7 @@ static void zrle_encoder_on_done(void* obj)
 	encoder_finish_frame(&self->encoder, result, pts);
 
 	rcbuf_unref(result);
+	encoder_unref(&self->encoder);
 }
 
 struct encoder* zrle_encoder_new(void)
@@ -386,7 +387,7 @@ struct encoder* zrle_encoder_new(void)
 	if (!self)
 		return NULL;
 
-	self->encoder.impl = &encoder_impl_zrle;
+	encoder_init(&self->encoder, &encoder_impl_zrle);
 
 	int rc = deflateInit2(&self->zs,
 			/* compression level: */ 1,
@@ -413,6 +414,8 @@ static void zrle_encoder_destroy(struct encoder* encoder)
 	deflateEnd(&self->zs);
 	if (self->work)
 		aml_unref(self->work);
+	if (self->current_result)
+		rcbuf_unref(self->current_result);
 	free(self);
 }
 
@@ -439,8 +442,11 @@ static int zrle_encoder_encode(struct encoder* encoder, struct nvnc_fb* fb,
 	nvnc_fb_ref(self->current_fb);
 	pixman_region_copy(&self->current_damage, damage);
 
+	encoder_ref(&self->encoder);
+
 	int rc = aml_start(aml_get_default(), self->work);
 	if (rc < 0) {
+		encoder_unref(&self->encoder);
 		aml_unref(self->work);
 		self->work = NULL;
 		pixman_region_clear(&self->current_damage);
