@@ -1,3 +1,10 @@
+neatvnc (0.6.0+dfsg-1) unstable; urgency=medium
+
+  * New upstream release.
+  * debian/control: Limit libaml requirement to 0.3+.
+
+ -- Boyuan Yang <byang@debian.org>  Mon, 24 Jul 2023 21:17:42 -0400
+
 neatvnc (0.5.4+dfsg-1) unstable; urgency=medium
 
   * New upstream release.

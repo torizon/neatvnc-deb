@@ -2,11 +2,11 @@ Source: neatvnc
 Priority: optional
 Section: libs
 Maintainer: Boyuan Yang <byang@debian.org>
-Standards-Version: 4.6.1
+Standards-Version: 4.6.2
 Build-Depends:
  debhelper-compat (= 13),
  gnutls-dev,
- libaml-dev,
+ libaml-dev (>= 0.3),
  libdrm-dev,
  libpixman-1-dev,
  libturbojpeg0-dev,
