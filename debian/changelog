@@ -1,3 +1,10 @@
+neatvnc (0.6.0+dfsg-2) unstable; urgency=medium
+
+  * debian/rules: Enable post-build tests, accidentally missing
+    in last build.
+
+ -- Boyuan Yang <byang@debian.org>  Mon, 24 Jul 2023 21:21:37 -0400
+
 neatvnc (0.6.0+dfsg-1) unstable; urgency=medium
 
   * New upstream release.
