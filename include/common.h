@@ -69,6 +69,8 @@ struct nvnc_client {
 	struct nvnc_common common;
 	int ref;
 	struct stream* net_stream;
+	char hostname[256];
+	char username[256];
 	struct nvnc* server;
 	enum nvnc_client_state state;
 	bool has_pixfmt;
@@ -90,6 +92,7 @@ struct nvnc_client {
 	bool is_qemu_key_ext_notified;
 	struct encoder* encoder;
 	uint32_t cursor_seq;
+	int quality;
 };
 
 LIST_HEAD(nvnc_client_list, nvnc_client);

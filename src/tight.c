@@ -19,7 +19,6 @@
 #include "common.h"
 #include "pixels.h"
 #include "vec.h"
-#include "tight.h"
 #include "config.h"
 #include "enc-util.h"
 #include "fb.h"
@@ -66,7 +65,7 @@ struct tight_encoder {
 	uint32_t height;
 	uint32_t grid_width;
 	uint32_t grid_height;
-	enum tight_quality quality;
+	int quality;
 
 	struct tight_tile* grid;
 
@@ -350,13 +349,7 @@ static int tight_encode_tile_jpeg(struct tight_encoder* self,
 	unsigned char* buffer = NULL;
 	unsigned long size = 0;
 
-	int quality; /* 1 - 100 */
-
-	switch (self->quality) {
-	case TIGHT_QUALITY_HIGH: quality = 66; break;
-	case TIGHT_QUALITY_LOW: quality = 33; break;
-	default: abort();
-	}
+	int quality = 11 * self->quality + 1;
 
 	uint32_t fourcc = nvnc_fb_get_fourcc_format(self->fb);
 	enum TJPF tjfmt = tight_get_jpeg_pixfmt(fourcc);
@@ -371,9 +364,11 @@ static int tight_encode_tile_jpeg(struct tight_encoder* self,
 	int32_t stride = nvnc_fb_get_stride(self->fb);
 	void* img = (uint32_t*)addr + x + y * stride;
 
+	enum TJSAMP subsampling = (quality == 9) ? TJSAMP_444 : TJSAMP_420;
+
 	int rc = -1;
 	rc = tjCompress2(handle, img, width, stride * 4, height, tjfmt, &buffer,
-			&size, TJSAMP_422, quality, TJFLAG_FASTDCT);
+			&size, subsampling, quality, TJFLAG_FASTDCT);
 	if (rc < 0) {
 		nvnc_log(NVNC_LOG_ERROR, "Failed to encode tight JPEG box: %s",
 				tjGetErrorStr());
@@ -411,17 +406,10 @@ static void tight_encode_tile(struct tight_encoder* self,
 	tile->size = 0;
 
 #ifdef HAVE_JPEG
-	switch (self->quality) {
-	case TIGHT_QUALITY_LOSSLESS:
+	if (self->quality >= 10) {
 		tight_encode_tile_basic(self, tile, x, y, width, height, gx % 4);
-		break;
-	case TIGHT_QUALITY_HIGH:
-	case TIGHT_QUALITY_LOW:
-		// TODO: Use more workers for jpeg
+	} else {
 		tight_encode_tile_jpeg(self, tile, x, y, width, height);
-		break;
-	case TIGHT_QUALITY_UNSPEC:
-		abort();
 	}
 #else
 	tight_encode_tile_basic(self, tile, x, y, width, height, gx % 4);
@@ -451,13 +439,19 @@ static void on_tight_zs_work_done(void* obj)
 		nvnc_fb_unref(self->fb);
 		schedule_tight_finish(self);
 	}
+
+	encoder_unref(&self->encoder);
 }
 
 static int tight_schedule_zs_work(struct tight_encoder* self, int index)
 {
+	encoder_ref(&self->encoder);
+
 	int rc = aml_start(aml_get_default(), self->zs_worker[index]);
 	if (rc >= 0)
 		++self->n_jobs;
+	else
+		encoder_unref(&self->encoder);
 
 	return rc;
 }
@@ -505,7 +499,6 @@ static void tight_finish(struct tight_encoder* self)
 
 static void do_tight_finish(void* obj)
 {
-	// TODO: Make sure there's no use-after-free here
 	struct tight_encoder* self = aml_get_userdata(obj);
 	tight_finish(self);
 }
@@ -523,14 +516,19 @@ static void on_tight_finished(void* obj)
 
 	self->pts = NVNC_NO_PTS;
 	rcbuf_unref(result);
+	encoder_unref(&self->encoder);
 }
 
 static int schedule_tight_finish(struct tight_encoder* self)
 {
+	encoder_ref(&self->encoder);
+
 	struct aml_work* work = aml_work_new(do_tight_finish, on_tight_finished,
 			self, NULL);
-	if (!work)
+	if (!work) {
+		encoder_unref(&self->encoder);
 		return -1;
+	}
 
 	int rc = aml_start(aml_get_default(), work);
 	aml_unref(work);
@@ -548,7 +546,7 @@ struct encoder* tight_encoder_new(uint16_t width, uint16_t height)
 		return NULL;
 	}
 
-	self->encoder.impl = &encoder_impl_tight;
+	encoder_init(&self->encoder, &encoder_impl_tight);
 
 	return (struct encoder*)self;
 }
@@ -620,7 +618,7 @@ static int tight_encoder_encode(struct encoder* encoder, struct nvnc_fb* fb,
 struct encoder_impl encoder_impl_tight = {
 	.destroy = tight_encoder_destroy_wrapper,
 	.set_output_format = tight_encoder_set_output_format,
-	.set_tight_quality = tight_encoder_set_quality,
+	.set_quality = tight_encoder_set_quality,
 	.resize = tight_encoder_resize_wrapper,
 	.encode = tight_encoder_encode,
 };

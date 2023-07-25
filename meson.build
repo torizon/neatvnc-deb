@@ -1,10 +1,11 @@
 project(
 	'neatvnc',
 	'c',
-	version: '0.5.4',
+	version: '0.6.0',
 	license: 'ISC',
 	default_options: [
 		'c_std=gnu11',
+		'warning_level=2',
 	],
 )
 
@@ -15,7 +16,10 @@ c_args = [
 	'-DPROJECT_VERSION="@0@"'.format(meson.project_version()),
 	'-D_GNU_SOURCE',
 	'-fvisibility=hidden',
+	'-DAML_UNSTABLE_API=1',
+
 	'-Wmissing-prototypes',
+	'-Wno-unused-parameter',
 ]
 
 if buildtype != 'debug' and buildtype != 'debugoptimized'
@@ -53,11 +57,12 @@ libavcodec = dependency('libavcodec', required: get_option('h264'))
 libavfilter = dependency('libavfilter', required: get_option('h264'))
 libavutil = dependency('libavutil', required: get_option('h264'))
 
-aml_project = subproject('aml', required: false)
+aml_version = ['>=0.3.0', '<0.4.0']
+aml_project = subproject('aml', required: false, version: aml_version)
 if aml_project.found()
 	aml = aml_project.get_variable('aml_dep')
 else
-	aml = dependency('aml')
+	aml = dependency('aml', version: aml_version)
 endif
 
 inc = include_directories('include')
@@ -114,14 +119,11 @@ if gbm.found()
 	config.set('HAVE_GBM', true)
 endif
 
-if libavutil.found()
-	config.set('HAVE_LIBAVUTIL', true)
-endif
-
 if gbm.found() and libdrm.found() and libavcodec.found() and libavfilter.found() and libavutil.found()
 	sources += [ 'src/h264-encoder.c', 'src/open-h264.c' ]
 	dependencies += [libdrm, libavcodec, libavfilter, libavutil]
 	config.set('ENABLE_OPEN_H264', true)
+	config.set('HAVE_LIBAVUTIL', true)
 endif
 
 configure_file(
