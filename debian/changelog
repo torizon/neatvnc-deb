@@ -1,8 +1,11 @@
 neatvnc (0.6.0+dfsg-4) unstable; urgency=medium
 
   * debian/rules: Enable verbose build.
+  * debian/rules: Allow build failure in tests for big-endian
+    architectures. (See upstream issue 85)
+  * debian/rules: Echo full test log for verbose debugging.
 
- -- Boyuan Yang <byang@debian.org>  Tue, 25 Jul 2023 09:40:36 -0400
+ -- Boyuan Yang <byang@debian.org>  Tue, 25 Jul 2023 09:46:04 -0400
 
 neatvnc (0.6.0+dfsg-3) unstable; urgency=medium
 
