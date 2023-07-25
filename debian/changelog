@@ -2,10 +2,11 @@ neatvnc (0.6.0+dfsg-2) unstable; urgency=medium
 
   * debian/rules: Enable post-build tests, accidentally missing
     in last build.
-  * debian/control: Add missing optional build-dependency: ffmpeg,
-    libgbm.
+  * debian/control:
+    + Add missing optional build-dependency: ffmpeg, libgbm.
+    + Also add these binary dependencies for -dev packages.
 
- -- Boyuan Yang <byang@debian.org>  Mon, 24 Jul 2023 21:25:26 -0400
+ -- Boyuan Yang <byang@debian.org>  Mon, 24 Jul 2023 21:45:21 -0400
 
 neatvnc (0.6.0+dfsg-1) unstable; urgency=medium
 
