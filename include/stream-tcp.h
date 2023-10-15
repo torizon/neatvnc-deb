@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020 - 2021 Andri Yngvason
+ * Copyright (c) 2023 Andri Yngvason
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -16,26 +16,21 @@
 
 #pragma once
 
-#include <stdint.h>
+#include "stream.h"
 
-struct pixman_region16;
-struct nvnc_fb;
-struct XXH3_state_s;
+#include <unistd.h>
 
-struct damage_refinery {
-	struct XXH3_state_s* state;
-	uint32_t* hashes;
-	uint32_t width;
-	uint32_t height;
-};
+struct stream;
 
-int damage_refinery_init(struct damage_refinery* self, uint32_t width,
-		uint32_t height);
-int damage_refinery_resize(struct damage_refinery* self, uint32_t width,
-		uint32_t height);
-void damage_refinery_destroy(struct damage_refinery* self);
-
-void damage_refine(struct damage_refinery* self,
-		struct pixman_region16* refined, 
-		struct pixman_region16* hint,
-		struct nvnc_fb* buffer);
+int stream_tcp_init(struct stream* self, int fd, stream_event_fn on_event,
+		void* userdata);
+int stream_tcp_close(struct stream* self);
+void stream_tcp_destroy(struct stream* self);
+ssize_t stream_tcp_read(struct stream* self, void* dst, size_t size);
+int stream_tcp_send(struct stream* self, struct rcbuf* payload,
+                stream_req_fn on_done, void* userdata);
+int stream_tcp_send_first(struct stream* self, struct rcbuf* payload);
+void stream_tcp_exec_and_send(struct stream* self,
+		stream_exec_fn exec_fn, void* userdata);
+int stream_tcp_install_cipher(struct stream* self,
+		struct crypto_cipher* cipher);

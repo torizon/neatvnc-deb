@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020 - 2021 Andri Yngvason
+ * Copyright (c) 2020 - 2023 Andri Yngvason
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -16,26 +16,24 @@
 
 #pragma once
 
-#include <stdint.h>
+#include "stream.h"
 
-struct pixman_region16;
-struct nvnc_fb;
-struct XXH3_state_s;
+#include <aml.h>
 
-struct damage_refinery {
-	struct XXH3_state_s* state;
-	uint32_t* hashes;
-	uint32_t width;
-	uint32_t height;
-};
+static inline void stream__poll_r(struct stream* self)
+{
+	aml_set_event_mask(self->handler, AML_EVENT_READ);
+}
 
-int damage_refinery_init(struct damage_refinery* self, uint32_t width,
-		uint32_t height);
-int damage_refinery_resize(struct damage_refinery* self, uint32_t width,
-		uint32_t height);
-void damage_refinery_destroy(struct damage_refinery* self);
+static inline void stream__poll_w(struct stream* self)
+{
+	aml_set_event_mask(self->handler, AML_EVENT_WRITE);
+}
 
-void damage_refine(struct damage_refinery* self,
-		struct pixman_region16* refined, 
-		struct pixman_region16* hint,
-		struct nvnc_fb* buffer);
+static inline void stream__poll_rw(struct stream* self)
+{
+	aml_set_event_mask(self->handler, AML_EVENT_READ | AML_EVENT_WRITE);
+}
+
+void stream_req__finish(struct stream_req* req, enum stream_req_status status);
+void stream__remote_closed(struct stream* self);

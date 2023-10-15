@@ -50,6 +50,7 @@
 
 struct nvnc;
 struct nvnc_client;
+struct nvnc_desktop_layout;
 struct nvnc_display;
 struct nvnc_fb;
 struct nvnc_fb_pool;
@@ -93,6 +94,11 @@ enum nvnc_log_level {
 	NVNC_LOG_TRACE = 5,
 };
 
+enum nvnc_auth_flags {
+	NVNC_AUTH_REQUIRE_AUTH = 1 << 0,
+	NVNC_AUTH_REQUIRE_ENCRYPTION = 1 << 1,
+};
+
 struct nvnc_log_data {
 	enum nvnc_log_level level;
 	const char* file;
@@ -117,11 +123,14 @@ typedef struct nvnc_fb* (*nvnc_fb_alloc_fn)(uint16_t width, uint16_t height,
 		uint32_t format, uint16_t stride);
 typedef void (*nvnc_cleanup_fn)(void* userdata);
 typedef void (*nvnc_log_fn)(const struct nvnc_log_data*, const char* message);
+typedef bool (*nvnc_desktop_layout_fn)(
+		struct nvnc_client*, const struct nvnc_desktop_layout*);
 
 extern const char nvnc_version[];
 
 struct nvnc* nvnc_open(const char* addr, uint16_t port);
 struct nvnc* nvnc_open_unix(const char *addr);
+struct nvnc* nvnc_open_websocket(const char* addr, uint16_t port);
 void nvnc_close(struct nvnc* self);
 
 void nvnc_add_display(struct nvnc*, struct nvnc_display*);
@@ -148,10 +157,14 @@ void nvnc_set_fb_req_fn(struct nvnc* self, nvnc_fb_req_fn);
 void nvnc_set_new_client_fn(struct nvnc* self, nvnc_client_fn);
 void nvnc_set_client_cleanup_fn(struct nvnc_client* self, nvnc_client_fn fn);
 void nvnc_set_cut_text_fn(struct nvnc*, nvnc_cut_text_fn fn);
+void nvnc_set_desktop_layout_fn(struct nvnc* self, nvnc_desktop_layout_fn);
 
 bool nvnc_has_auth(void);
-int nvnc_enable_auth(struct nvnc* self, const char* privkey_path,
-                     const char* cert_path, nvnc_auth_fn, void* userdata);
+int nvnc_enable_auth(struct nvnc* self, enum nvnc_auth_flags flags,
+		nvnc_auth_fn, void* userdata);
+int nvnc_set_tls_creds(struct nvnc* self, const char* privkey_path,
+                     const char* cert_path);
+int nvnc_set_rsa_creds(struct nvnc* self, const char* private_key_path);
 
 struct nvnc_fb* nvnc_fb_new(uint16_t width, uint16_t height,
                             uint32_t fourcc_format, uint16_t stride);
@@ -201,6 +214,20 @@ struct nvnc* nvnc_display_get_server(const struct nvnc_display*);
 
 void nvnc_display_feed_buffer(struct nvnc_display*, struct nvnc_fb*,
 			      struct pixman_region16* damage);
+
+uint16_t nvnc_desktop_layout_get_width(const struct nvnc_desktop_layout*);
+uint16_t nvnc_desktop_layout_get_height(const struct nvnc_desktop_layout*);
+uint8_t nvnc_desktop_layout_get_display_count(const struct nvnc_desktop_layout*);
+uint16_t nvnc_desktop_layout_get_display_x_pos(
+		const struct nvnc_desktop_layout*, uint8_t display_index);
+uint16_t nvnc_desktop_layout_get_display_y_pos(
+		const struct nvnc_desktop_layout*, uint8_t display_index);
+uint16_t nvnc_desktop_layout_get_display_width(
+		const struct nvnc_desktop_layout*, uint8_t display_index);
+uint16_t nvnc_desktop_layout_get_display_height(
+		const struct nvnc_desktop_layout*, uint8_t display_index);
+struct nvnc_display* nvnc_desktop_layout_get_display(
+		const struct nvnc_desktop_layout*, uint8_t display_index);
 
 void nvnc_send_cut_text(struct nvnc*, const char* text, uint32_t len);
 

@@ -1,5 +1,5 @@
-/*
- * Copyright (c) 2020 - 2021 Andri Yngvason
+/* Copyright (c) 2014-2016, Marel
+ * Copyright (c) 2023, Andri Yngvason
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -16,26 +16,22 @@
 
 #pragma once
 
-#include <stdint.h>
+#define HTTP_FIELD_INDEX_MAX 32
 
-struct pixman_region16;
-struct nvnc_fb;
-struct XXH3_state_s;
+#include <stddef.h>
 
-struct damage_refinery {
-	struct XXH3_state_s* state;
-	uint32_t* hashes;
-	uint32_t width;
-	uint32_t height;
+struct http_kv {
+	char* key;
+	char* value;
 };
 
-int damage_refinery_init(struct damage_refinery* self, uint32_t width,
-		uint32_t height);
-int damage_refinery_resize(struct damage_refinery* self, uint32_t width,
-		uint32_t height);
-void damage_refinery_destroy(struct damage_refinery* self);
+struct http_req {
+	size_t header_length;
+	size_t content_length;
+	char* content_type;
+	size_t field_index;
+	struct http_kv field[HTTP_FIELD_INDEX_MAX];
+};
 
-void damage_refine(struct damage_refinery* self,
-		struct pixman_region16* refined, 
-		struct pixman_region16* hint,
-		struct nvnc_fb* buffer);
+int http_req_parse(struct http_req* req, const char* head);
+void http_req_free(struct http_req* req);

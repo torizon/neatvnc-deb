@@ -22,10 +22,11 @@
 #define UDIV_UP(a, b) (((a) + (b) - 1) / (b))
 #define ARRAY_LEN(a) (sizeof(a) / (sizeof(a[0])))
 
-static bool test_pixel32_to_cpixel_4bpp(void)
+static bool test_pixel_to_cpixel_4bpp(void)
 {
-	uint32_t src = u32_le(0x11223344);
+	uint32_t src = u32_le(0x11223344u);
 	uint32_t dst;
+	uint8_t* src_addr = (uint8_t*)&src;
 
 	struct rfb_pixel_format dstfmt = { 0 }, srcfmt = { 0 };
 
@@ -33,26 +34,64 @@ static bool test_pixel32_to_cpixel_4bpp(void)
 
 	dst = 0;
 	rfb_pixfmt_from_fourcc(&srcfmt, DRM_FORMAT_RGBA8888);
-	pixel32_to_cpixel((uint8_t*)&dst, &dstfmt, &src, &srcfmt, 4, 1);
-	if ((src & 0xffffff00) != (dst & 0xffffff00))
+	pixel_to_cpixel((uint8_t*)&dst, &dstfmt, src_addr, &srcfmt, 4, 1);
+	if ((src & 0xffffff00u) != (dst & 0xffffff00u))
 		return false;
 
 	dst = 0;
 	rfb_pixfmt_from_fourcc(&dstfmt, DRM_FORMAT_ABGR8888);
-	pixel32_to_cpixel((uint8_t*)&dst, &dstfmt, &src, &srcfmt, 4, 1);
-	if (dst != u32_le(0x00332211))
+	pixel_to_cpixel((uint8_t*)&dst, &dstfmt, src_addr, &srcfmt, 4, 1);
+	if (dst != u32_le(0x00332211u))
 		return false;
 
 	dst = 0;
 	rfb_pixfmt_from_fourcc(&dstfmt, DRM_FORMAT_ARGB8888);
-	pixel32_to_cpixel((uint8_t*)&dst, &dstfmt, &src, &srcfmt, 4, 1);
-	if (dst != u32_le(0x00112233))
+	pixel_to_cpixel((uint8_t*)&dst, &dstfmt, src_addr, &srcfmt, 4, 1);
+	if (dst != u32_le(0x00112233u))
 		return false;
 
 	dst = 0;
 	rfb_pixfmt_from_fourcc(&dstfmt, DRM_FORMAT_BGRA8888);
-	pixel32_to_cpixel((uint8_t*)&dst, &dstfmt, &src, &srcfmt, 4, 1);
-	if (dst != u32_le(0x33221100))
+	pixel_to_cpixel((uint8_t*)&dst, &dstfmt, src_addr, &srcfmt, 4, 1);
+	if (dst != u32_le(0x33221100u))
+		return false;
+
+	return true;
+}
+
+static bool test_pixel_to_cpixel_3bpp(void)
+{
+	//44 is extra data that should not be copied anywhere below.
+	uint32_t src = u32_le(0x44112233u);
+	uint32_t dst;
+	uint8_t* src_addr = (uint8_t*)&src;
+
+	struct rfb_pixel_format dstfmt = { 0 }, srcfmt = { 0 };
+
+	rfb_pixfmt_from_fourcc(&srcfmt, DRM_FORMAT_RGB888);
+
+	dst = 0;
+	rfb_pixfmt_from_fourcc(&dstfmt, DRM_FORMAT_RGBA8888);
+	pixel_to_cpixel((uint8_t*)&dst, &dstfmt, src_addr, &srcfmt, 4, 1);
+	if (dst != u32_le(0x11223300u))
+		return false;
+
+	dst = 0;
+	rfb_pixfmt_from_fourcc(&dstfmt, DRM_FORMAT_ABGR8888);
+	pixel_to_cpixel((uint8_t*)&dst, &dstfmt, src_addr, &srcfmt, 4, 1);
+	if (dst != u32_le(0x00332211u))
+		return false;
+
+	dst = 0;
+	rfb_pixfmt_from_fourcc(&dstfmt, DRM_FORMAT_ARGB8888);
+	pixel_to_cpixel((uint8_t*)&dst, &dstfmt, src_addr, &srcfmt, 4, 1);
+	if (dst != u32_le(0x00112233u))
+		return false;
+
+	dst = 0;
+	rfb_pixfmt_from_fourcc(&dstfmt, DRM_FORMAT_BGRA8888);
+	pixel_to_cpixel((uint8_t*)&dst, &dstfmt, src_addr, &srcfmt, 4, 1);
+	if (dst != u32_le(0x33221100u))
 		return false;
 
 	return true;
@@ -87,14 +126,14 @@ static bool test_fourcc_to_pixman_fmt(void)
 static bool test_extract_alpha_mask_rgba8888(void)
 {
 	uint32_t test_data[] = {
-		u32_le(0x00000000), // Black, transparent
-		u32_le(0xff000000), // Red, transparent
-		u32_le(0x00ff0000), // Red, transparent
-		u32_le(0x0000ff00), // Green, transparent
-		u32_le(0x000000ff), // Black, opaque
-		u32_le(0xff0000ff), // Red, opaque
-		u32_le(0x00ff00ff), // Red, opaque
-		u32_le(0x0000ffff), // Green, opaque
+		u32_le(0x00000000u), // Black, transparent
+		u32_le(0xff000000u), // Red, transparent
+		u32_le(0x00ff0000u), // Red, transparent
+		u32_le(0x0000ff00u), // Green, transparent
+		u32_le(0x000000ffu), // Black, opaque
+		u32_le(0xff0000ffu), // Red, opaque
+		u32_le(0x00ff00ffu), // Red, opaque
+		u32_le(0x0000ffffu), // Green, opaque
 	};
 
 	uint8_t mask[UDIV_UP(ARRAY_LEN(test_data), 8)] = { 0 };
@@ -173,7 +212,8 @@ static bool test_rfb_pixfmt_to_string(void)
 
 int main()
 {
-	bool ok = test_pixel32_to_cpixel_4bpp() &&
+	bool ok = test_pixel_to_cpixel_4bpp() &&
+		test_pixel_to_cpixel_3bpp() &&
 		test_fourcc_to_pixman_fmt() &&
 		test_extract_alpha_mask_rgba8888() &&
 		test_drm_format_to_string() &&

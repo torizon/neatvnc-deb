@@ -1,5 +1,4 @@
-/*
- * Copyright (c) 2020 - 2021 Andri Yngvason
+/* Copyright (c) 2023 Andri Yngvason
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -17,25 +16,10 @@
 #pragma once
 
 #include <stdint.h>
+#include <unistd.h>
 
-struct pixman_region16;
-struct nvnc_fb;
-struct XXH3_state_s;
+#define BASE64_ENCODED_SIZE(x) ((((x) + 2) / 3) * 4 + 1)
+#define BASE64_DECODED_MAX_SIZE(x) ((((x) + 3) / 4) * 3)
 
-struct damage_refinery {
-	struct XXH3_state_s* state;
-	uint32_t* hashes;
-	uint32_t width;
-	uint32_t height;
-};
-
-int damage_refinery_init(struct damage_refinery* self, uint32_t width,
-		uint32_t height);
-int damage_refinery_resize(struct damage_refinery* self, uint32_t width,
-		uint32_t height);
-void damage_refinery_destroy(struct damage_refinery* self);
-
-void damage_refine(struct damage_refinery* self,
-		struct pixman_region16* refined, 
-		struct pixman_region16* hint,
-		struct nvnc_fb* buffer);
+void base64_encode(char* dst, const uint8_t* src, size_t src_len);
+ssize_t base64_decode(uint8_t* dst, const char* src);

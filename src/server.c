@@ -18,6 +18,7 @@
 #include "vec.h"
 #include "type-macros.h"
 #include "fb.h"
+#include "desktop-layout.h"
 #include "display.h"
 #include "neatvnc.h"
 #include "common.h"
@@ -32,6 +33,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <inttypes.h>
 #include <unistd.h>
 #include <sys/queue.h>
 #include <sys/param.h>
@@ -52,6 +54,10 @@
 #include <gnutls/gnutls.h>
 #endif
 
+#ifdef HAVE_CRYPTO
+#include "crypto.h"
+#endif
+
 #ifndef DRM_FORMAT_INVALID
 #define DRM_FORMAT_INVALID 0
 #endif
@@ -61,16 +67,15 @@
 #endif
 
 #define DEFAULT_NAME "Neat VNC"
+#define SECURITY_TYPES_MAX 3
+#define APPLE_DH_SERVER_KEY_LENGTH 256
+
+#define UDIV_UP(a, b) (((a) + (b) - 1) / (b))
 
 #define EXPORT __attribute__((visibility("default")))
 
-enum addrtype {
-	ADDRTYPE_TCP,
-	ADDRTYPE_UNIX,
-};
-
 static int send_desktop_resize(struct nvnc_client* client, struct nvnc_fb* fb);
-static int send_qemu_key_ext_frame(struct nvnc_client* client);
+static bool send_ext_support_frame(struct nvnc_client* client);
 static enum rfb_encodings choose_frame_encoding(struct nvnc_client* client,
 		struct nvnc_fb*);
 static void on_encode_frame_done(struct encoder*, struct rcbuf*, uint64_t pts);
@@ -97,6 +102,13 @@ static uint64_t nvnc__htonll(uint64_t x)
 #endif
 }
 
+static uint64_t gettime_us(clockid_t clock)
+{
+	struct timespec ts = { 0 };
+	clock_gettime(clock, &ts);
+	return ts.tv_sec * 1000000ULL + ts.tv_nsec / 1000ULL;
+}
+
 static void client_close(struct nvnc_client* client)
 {
 	nvnc_log(NVNC_LOG_INFO, "Closing client connection %p: ref %d", client,
@@ -114,6 +126,11 @@ static void client_close(struct nvnc_client* client)
 		nvnc_fb_release(client->current_fb);
 		nvnc_fb_unref(client->current_fb);
 	}
+
+#ifdef HAVE_CRYPTO
+	crypto_key_del(client->apple_dh_secret);
+	crypto_rsa_pub_key_del(client->rsa.pub);
+#endif
 
 	LIST_REMOVE(client, link);
 	stream_destroy(client->net_stream);
@@ -142,12 +159,36 @@ static inline void client_ref(struct nvnc_client* client)
 	++client->ref;
 }
 
+static void do_deferred_client_close(void *obj)
+{
+	client_unref(obj);
+}
+
+static void stop_self(void* obj)
+{
+	aml_stop(aml_get_default(), obj);
+}
+
+static void defer_client_close(struct nvnc_client* client)
+{
+	struct aml_idle* idle = aml_idle_new(stop_self, client,
+			do_deferred_client_close);
+	aml_start(aml_get_default(), idle);
+	aml_unref(idle);
+}
+
 static void close_after_write(void* userdata, enum stream_req_status status)
 {
 	struct nvnc_client* client = userdata;
 	nvnc_log(NVNC_LOG_DEBUG, "close_after_write(%p): ref %d", client,
 			client->ref);
-	nvnc_client_close(client);
+	stream_close(client->net_stream);
+
+	/* This is a rather hacky way of making sure that the client object
+	 * stays alive while the stream is processing its queue.
+	 * TODO: Figure out some better resource management for clients
+	 */
+	defer_client_close(client);
 }
 
 static int handle_unsupported_version(struct nvnc_client* client)
@@ -173,6 +214,8 @@ static int handle_unsupported_version(struct nvnc_client* client)
 
 static int on_version_message(struct nvnc_client* client)
 {
+	struct nvnc* server = client->server;
+
 	if (client->buffer_len - client->buffer_index < 12)
 		return 0;
 
@@ -183,17 +226,40 @@ static int on_version_message(struct nvnc_client* client)
 	if (strcmp(RFB_VERSION_MESSAGE, version_string) != 0)
 		return handle_unsupported_version(client);
 
-	struct rfb_security_types_msg security = { 0 };
-	security.n = 1;
-	security.types[0] = RFB_SECURITY_TYPE_NONE;
+	uint8_t buf[sizeof(struct rfb_security_types_msg) +
+		SECURITY_TYPES_MAX] = {};
+	struct rfb_security_types_msg* security =
+		(struct rfb_security_types_msg*)buf;
+
+	security->n = 0;
+	if (server->auth_flags & NVNC_AUTH_REQUIRE_AUTH) {
+		assert(server->auth_fn);
 
 #ifdef ENABLE_TLS
-	if (client->server->auth_fn)
-		security.types[0] = RFB_SECURITY_TYPE_VENCRYPT;
+		if (server->tls_creds) {
+			security->types[security->n++] = RFB_SECURITY_TYPE_VENCRYPT;
+		}
 #endif
 
-	stream_write(client->net_stream, &security, sizeof(security), NULL,
-	             NULL);
+#ifdef HAVE_CRYPTO
+		security->types[security->n++] = RFB_SECURITY_TYPE_RSA_AES256;
+		security->types[security->n++] = RFB_SECURITY_TYPE_RSA_AES;
+
+		if (!(server->auth_flags & NVNC_AUTH_REQUIRE_ENCRYPTION)) {
+			security->types[security->n++] = RFB_SECURITY_TYPE_APPLE_DH;
+		}
+#endif
+	} else {
+		security->n = 1;
+		security->types[0] = RFB_SECURITY_TYPE_NONE;
+	}
+
+	if (security->n == 0) {
+		nvnc_log(NVNC_LOG_PANIC, "Failed to satisfy requested security constraints");
+	}
+
+	stream_write(client->net_stream, security, sizeof(*security) +
+			security->n, NULL, NULL);
 
 	client->state = VNC_CLIENT_STATE_WAITING_FOR_SECURITY;
 	return 12;
@@ -206,14 +272,14 @@ static int security_handshake_failed(struct nvnc_client* client,
 
 	client->state = VNC_CLIENT_STATE_ERROR;
 
-	uint8_t* result = (uint8_t*)buffer;
+	uint32_t* result = (uint32_t*)buffer;
 
 	struct rfb_error_reason* reason =
 	        (struct rfb_error_reason*)(buffer + sizeof(*result));
 
 	*result = htonl(RFB_SECURITY_HANDSHAKE_FAILED);
 	reason->length = htonl(strlen(reason_string));
-	(void)strcmp(reason->message, reason_string);
+	strcpy(reason->message, reason_string);
 
 	size_t len = sizeof(*result) + sizeof(*reason) + strlen(reason_string);
 	stream_write(client->net_stream, buffer, len, close_after_write,
@@ -345,12 +411,381 @@ static int on_vencrypt_plain_auth_message(struct nvnc_client* client)
 }
 #endif
 
+#ifdef HAVE_CRYPTO
+static int apple_dh_send_public_key(struct nvnc_client* client)
+{
+	client->apple_dh_secret = crypto_keygen();
+	assert(client->apple_dh_secret);
+
+	struct crypto_key* pub =
+		crypto_derive_public_key(client->apple_dh_secret);
+	assert(pub);
+
+	uint8_t mod[APPLE_DH_SERVER_KEY_LENGTH] = {};
+	int mod_len = crypto_key_p(pub, mod, sizeof(mod));
+	assert(mod_len == sizeof(mod));
+
+	uint8_t q[APPLE_DH_SERVER_KEY_LENGTH] = {};
+	int q_len = crypto_key_q(pub, q, sizeof(q));
+	assert(q_len == sizeof(q));
+
+	struct rfb_apple_dh_server_msg msg = {
+		.generator = htons(crypto_key_g(client->apple_dh_secret)),
+		.key_size = htons(q_len),
+	};
+
+	stream_write(client->net_stream, &msg, sizeof(msg), NULL, NULL);
+	stream_write(client->net_stream, mod, mod_len, NULL, NULL);
+	stream_write(client->net_stream, q, q_len, NULL, NULL);
+
+	crypto_key_del(pub);
+	return 0;
+}
+
+static int on_apple_dh_response(struct nvnc_client* client)
+{
+	struct nvnc* server = client->server;
+
+	struct rfb_apple_dh_client_msg* msg =
+	        (void*)(client->msg_buffer + client->buffer_index);
+
+	uint8_t p[APPLE_DH_SERVER_KEY_LENGTH];
+	int key_len = crypto_key_p(client->apple_dh_secret, p, sizeof(p));
+	assert(key_len == sizeof(p));
+
+	if (client->buffer_len - client->buffer_index < sizeof(*msg) + key_len)
+		return 0;
+
+	int g = crypto_key_g(client->apple_dh_secret);
+
+	struct crypto_key* remote_key = crypto_key_new(g, p, key_len,
+			msg->public_key, key_len);
+	assert(remote_key);
+
+	struct crypto_key* shared_secret =
+		crypto_derive_shared_secret(client->apple_dh_secret, remote_key);
+	assert(shared_secret);
+
+	uint8_t shared_buf[APPLE_DH_SERVER_KEY_LENGTH];
+	crypto_key_q(shared_secret, shared_buf, sizeof(shared_buf));
+	crypto_key_del(shared_secret);
+
+	uint8_t hash[16] = {};
+	crypto_hash_one(hash, sizeof(hash), CRYPTO_HASH_MD5, shared_buf,
+			sizeof(shared_buf));
+
+	struct crypto_cipher* cipher;
+	cipher = crypto_cipher_new(NULL, hash, CRYPTO_CIPHER_AES128_ECB);
+	assert(cipher);
+
+	char username[128] = {};
+	char* password = username + 64;
+
+	crypto_cipher_decrypt(cipher, (uint8_t*)username, NULL,
+			msg->encrypted_credentials, sizeof(username), NULL, 0);
+	username[63] = '\0';
+	username[127] = '\0';
+	crypto_cipher_del(cipher);
+
+	if (server->auth_fn(username, password, server->auth_ud)) {
+		nvnc_log(NVNC_LOG_INFO, "User \"%s\" authenticated", username);
+		security_handshake_ok(client);
+		client->state = VNC_CLIENT_STATE_WAITING_FOR_INIT;
+	} else {
+		nvnc_log(NVNC_LOG_INFO, "User \"%s\" rejected", username);
+		security_handshake_failed(client, "Invalid username or password");
+		crypto_cipher_del(cipher);
+	}
+
+	return sizeof(*msg) + key_len;
+}
+
+static int rsa_aes_send_public_key(struct nvnc_client* client)
+{
+	struct nvnc* server = client->server;
+
+	if (!server->rsa_priv) {
+		assert(!server->rsa_pub);
+
+		nvnc_log(NVNC_LOG_WARNING, "An RSA key has not been set. A new key will be generated.");
+
+		server->rsa_priv = crypto_rsa_priv_key_new();
+		server->rsa_pub = crypto_rsa_pub_key_new();
+
+		crypto_rsa_keygen(server->rsa_pub, server->rsa_priv);
+	}
+	assert(server->rsa_pub && server->rsa_priv);
+
+	size_t key_len = crypto_rsa_pub_key_length(server->rsa_pub);
+	size_t buf_len = sizeof(struct rfb_rsa_aes_pub_key_msg) + key_len * 2;
+
+	char* buffer = calloc(1, buf_len);
+	assert(buffer);
+	struct rfb_rsa_aes_pub_key_msg* msg =
+		(struct rfb_rsa_aes_pub_key_msg*)buffer;
+
+	uint8_t* modulus = msg->modulus_and_exponent;
+	uint8_t* exponent = msg->modulus_and_exponent + key_len;
+
+	msg->length = htonl(key_len * 8);
+	crypto_rsa_pub_key_modulus(server->rsa_pub, modulus, key_len);
+	crypto_rsa_pub_key_exponent(server->rsa_pub, exponent, key_len);
+
+	stream_send(client->net_stream, rcbuf_new(buffer, buf_len), NULL, NULL);
+	return 0;
+}
+
+static int rsa_aes_send_challenge(struct nvnc_client* client,
+		struct crypto_rsa_pub_key* pub)
+{
+	crypto_random(client->rsa.challenge, client->rsa.challenge_len);
+
+	uint8_t buffer[1024];
+	struct rfb_rsa_aes_challenge_msg *msg =
+		(struct rfb_rsa_aes_challenge_msg*)buffer;
+
+	ssize_t len = crypto_rsa_encrypt(pub, msg->challenge,
+			crypto_rsa_pub_key_length(client->rsa.pub),
+			client->rsa.challenge, client->rsa.challenge_len);
+	msg->length = htons(len);
+
+	stream_write(client->net_stream, buffer, sizeof(*msg) + len, NULL, NULL);
+	return 0;
+}
+
+static int on_rsa_aes_public_key(struct nvnc_client* client)
+{
+	struct rfb_rsa_aes_pub_key_msg* msg =
+	        (void*)(client->msg_buffer + client->buffer_index);
+
+	if (client->buffer_len - client->buffer_index < sizeof(*msg))
+		return 0;
+
+	uint32_t bit_length = ntohl(msg->length);
+	size_t byte_length = UDIV_UP(bit_length, 8);
+
+	if (client->buffer_len - client->buffer_index <
+			sizeof(*msg) + byte_length * 2)
+		return 0;
+
+	const uint8_t* modulus = msg->modulus_and_exponent;
+	const uint8_t* exponent = msg->modulus_and_exponent + byte_length;
+
+	client->rsa.pub =
+		crypto_rsa_pub_key_import(modulus, exponent, byte_length);
+	assert(client->rsa.pub);
+
+	client->state = VNC_CLIENT_STATE_WAITING_FOR_RSA_AES_CHALLENGE;
+	rsa_aes_send_challenge(client, client->rsa.pub);
+
+	return sizeof(*msg) + byte_length * 2;
+}
+
+static size_t client_rsa_aes_hash_len(const struct nvnc_client* client)
+{
+	switch (client->rsa.hash_type) {
+	case CRYPTO_HASH_SHA1: return 20;
+	case CRYPTO_HASH_SHA256: return 32;
+	default:;
+	}
+	abort();
+	return 0;
+}
+
+static int on_rsa_aes_challenge(struct nvnc_client* client)
+{
+	struct rfb_rsa_aes_challenge_msg* msg =
+	        (void*)(client->msg_buffer + client->buffer_index);
+
+	if (client->buffer_len - client->buffer_index < sizeof(*msg))
+		return 0;
+
+	uint16_t length = ntohs(msg->length);
+	if (client->buffer_len - client->buffer_index < sizeof(*msg) + length)
+		return 0;
+
+	struct nvnc* server = client->server;
+
+	uint8_t client_random[32] = {};
+	ssize_t len = crypto_rsa_decrypt(server->rsa_priv, client_random,
+			client->rsa.challenge_len, msg->challenge, length);
+	if (len < 0) {
+		nvnc_log(NVNC_LOG_ERROR, "Failed to decrypt client's challenge");
+		client->state = VNC_CLIENT_STATE_ERROR;
+		nvnc_client_close(client);
+		goto done;
+	}
+
+	// ClientSessionKey = the first 16 bytes of SHA1(ServerRandom || ClientRandom)
+	uint8_t client_session_key[32];
+	crypto_hash_many(client_session_key, client_rsa_aes_hash_len(client),
+			client->rsa.hash_type, (const struct crypto_data_entry[]) {
+		{ client->rsa.challenge, client->rsa.challenge_len },
+		{ client_random, client->rsa.challenge_len },
+		{}
+	});
+
+	// ServerSessionKey = the first 16 bytes of SHA1(ClientRandom || ServerRandom)
+	uint8_t server_session_key[32];
+	crypto_hash_many(server_session_key, client_rsa_aes_hash_len(client),
+			client->rsa.hash_type, (const struct crypto_data_entry[]) {
+		{ client_random, client->rsa.challenge_len },
+		{ client->rsa.challenge, client->rsa.challenge_len },
+		{}
+	});
+
+	stream_upgrade_to_rsa_eas(client->net_stream, client->rsa.cipher_type,
+			server_session_key, client_session_key);
+
+	size_t server_key_len = crypto_rsa_pub_key_length(server->rsa_pub);
+	uint8_t* server_modulus = malloc(server_key_len * 2);
+	uint8_t* server_exponent = server_modulus + server_key_len;
+
+	crypto_rsa_pub_key_modulus(server->rsa_pub, server_modulus,
+			server_key_len);
+	crypto_rsa_pub_key_exponent(server->rsa_pub, server_exponent,
+			server_key_len);
+
+	size_t client_key_len = crypto_rsa_pub_key_length(client->rsa.pub);
+	uint8_t* client_modulus = malloc(client_key_len * 2);
+	uint8_t* client_exponent = client_modulus + client_key_len;
+
+	crypto_rsa_pub_key_modulus(client->rsa.pub, client_modulus,
+			client_key_len);
+	crypto_rsa_pub_key_exponent(client->rsa.pub, client_exponent,
+			client_key_len);
+
+	uint32_t server_key_len_be = htonl(server_key_len * 8);
+	uint32_t client_key_len_be = htonl(client_key_len * 8);
+
+	uint8_t server_hash[32] = {};
+	crypto_hash_many(server_hash, client_rsa_aes_hash_len(client),
+			client->rsa.hash_type, (const struct crypto_data_entry[]) {
+		{ (uint8_t*)&server_key_len_be, 4 },
+		{ server_modulus, server_key_len },
+		{ server_exponent, server_key_len },
+		{ (uint8_t*)&client_key_len_be, 4 },
+		{ client_modulus, client_key_len },
+		{ client_exponent, client_key_len },
+		{}
+	});
+
+	free(server_modulus);
+	free(client_modulus);
+
+	stream_write(client->net_stream, server_hash,
+			client_rsa_aes_hash_len(client), NULL, NULL);
+
+	client->state = VNC_CLIENT_STATE_WAITING_FOR_RSA_AES_CLIENT_HASH;
+done:
+	return sizeof(*msg) + length;
+}
+
+static int on_rsa_aes_client_hash(struct nvnc_client* client)
+{
+	const char* msg = (void*)(client->msg_buffer + client->buffer_index);
+
+	if (client->buffer_len - client->buffer_index < client_rsa_aes_hash_len(client))
+		return 0;
+
+	struct nvnc* server = client->server;
+
+	size_t server_key_len = crypto_rsa_pub_key_length(server->rsa_pub);
+	uint8_t* server_modulus = malloc(server_key_len * 2);
+	uint8_t* server_exponent = server_modulus + server_key_len;
+	crypto_rsa_pub_key_modulus(server->rsa_pub, server_modulus,
+			server_key_len);
+	crypto_rsa_pub_key_exponent(server->rsa_pub, server_exponent,
+			server_key_len);
+
+	size_t client_key_len = crypto_rsa_pub_key_length(client->rsa.pub);
+	uint8_t* client_modulus = malloc(client_key_len * 2);
+	uint8_t* client_exponent = client_modulus + client_key_len;
+
+	crypto_rsa_pub_key_modulus(client->rsa.pub, client_modulus,
+			client_key_len);
+	crypto_rsa_pub_key_exponent(client->rsa.pub, client_exponent,
+			client_key_len);
+
+	uint32_t server_key_len_be = htonl(server_key_len * 8);
+	uint32_t client_key_len_be = htonl(client_key_len * 8);
+
+	uint8_t client_hash[32] = {};
+	crypto_hash_many(client_hash, client_rsa_aes_hash_len(client),
+			client->rsa.hash_type, (const struct crypto_data_entry[]) {
+		{ (uint8_t*)&client_key_len_be, 4 },
+		{ client_modulus, client_key_len },
+		{ client_exponent, client_key_len },
+		{ (uint8_t*)&server_key_len_be, 4 },
+		{ server_modulus, server_key_len },
+		{ server_exponent, server_key_len },
+		{}
+	});
+
+	free(client_modulus);
+	free(server_modulus);
+
+	if (memcmp(msg, client_hash, client_rsa_aes_hash_len(client)) != 0) {
+		nvnc_log(NVNC_LOG_INFO, "Client hash mismatch");
+		nvnc_client_close(client);
+		return 0;
+	}
+
+	// TODO: Read this from config
+	uint8_t subtype = RFB_RSA_AES_CRED_SUBTYPE_USER_AND_PASS;
+	stream_write(client->net_stream, &subtype, 1, NULL, NULL);
+
+	client->state = VNC_CLIENT_STATE_WAITING_FOR_RSA_AES_CREDENTIALS;
+	return client_rsa_aes_hash_len(client);
+}
+
+static int on_rsa_aes_credentials(struct nvnc_client* client)
+{
+	const uint8_t* msg = (void*)(client->msg_buffer + client->buffer_index);
+
+	if (client->buffer_len - client->buffer_index < 2)
+		return 0;
+
+	size_t username_len = msg[0];
+	if (client->buffer_len - client->buffer_index < 2 + username_len)
+		return 0;
+
+	size_t password_len = msg[1 + username_len];
+	if (client->buffer_len - client->buffer_index < 2 + username_len +
+			password_len)
+		return 0;
+
+	struct nvnc* server = client->server;
+
+	char username[256];
+	char password[256];
+
+	memcpy(username, (const char*)(msg + 1), username_len);
+	username[username_len] = '\0';
+	memcpy(password, (const char*)(msg + 2 + username_len), password_len);
+	password[password_len] = '\0';
+
+	if (server->auth_fn(username, password, server->auth_ud)) {
+		nvnc_log(NVNC_LOG_INFO, "User \"%s\" authenticated", username);
+		security_handshake_ok(client);
+		client->state = VNC_CLIENT_STATE_WAITING_FOR_INIT;
+	} else {
+		nvnc_log(NVNC_LOG_INFO, "User \"%s\" rejected", username);
+		security_handshake_failed(client, "Invalid username or password");
+	}
+
+	return 2 + username_len + password_len;
+}
+
+#endif // HAVE_CRYPTO
+
 static int on_security_message(struct nvnc_client* client)
 {
 	if (client->buffer_len - client->buffer_index < 1)
 		return 0;
 
 	uint8_t type = client->msg_buffer[client->buffer_index];
+	nvnc_log(NVNC_LOG_DEBUG, "Client chose security type: %d", type);
 
 	switch (type) {
 	case RFB_SECURITY_TYPE_NONE:
@@ -361,6 +796,26 @@ static int on_security_message(struct nvnc_client* client)
 	case RFB_SECURITY_TYPE_VENCRYPT:
 		vencrypt_send_version(client);
 		client->state = VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_VERSION;
+		break;
+#endif
+#ifdef HAVE_CRYPTO
+	case RFB_SECURITY_TYPE_APPLE_DH:
+		apple_dh_send_public_key(client);
+		client->state = VNC_CLIENT_STATE_WAITING_FOR_APPLE_DH_RESPONSE;
+		break;
+	case RFB_SECURITY_TYPE_RSA_AES:
+		client->rsa.hash_type = CRYPTO_HASH_SHA1;
+		client->rsa.cipher_type = CRYPTO_CIPHER_AES_EAX;
+		client->rsa.challenge_len = 16;
+		rsa_aes_send_public_key(client);
+		client->state = VNC_CLIENT_STATE_WAITING_FOR_RSA_AES_PUBLIC_KEY;
+		break;
+	case RFB_SECURITY_TYPE_RSA_AES256:
+		client->rsa.hash_type = CRYPTO_HASH_SHA256;
+		client->rsa.cipher_type = CRYPTO_CIPHER_AES256_EAX;
+		client->rsa.challenge_len = 32;
+		rsa_aes_send_public_key(client);
+		client->state = VNC_CLIENT_STATE_WAITING_FOR_RSA_AES_PUBLIC_KEY;
 		break;
 #endif
 	default:
@@ -513,9 +968,12 @@ static int on_client_set_encodings(struct nvnc_client* client)
 		case RFB_ENCODING_OPEN_H264:
 		case RFB_ENCODING_CURSOR:
 		case RFB_ENCODING_DESKTOPSIZE:
+		case RFB_ENCODING_EXTENDEDDESKTOPSIZE:
 		case RFB_ENCODING_QEMU_EXT_KEY_EVENT:
-		case RFB_ENCODING_PTS:
 			client->encodings[n++] = encoding;
+		case RFB_ENCODING_PTS:
+		case RFB_ENCODING_NTP:
+			;
 		}
 
 		if (RFB_ENCODING_JPEG_LOWQ <= encoding &&
@@ -619,13 +1077,13 @@ static void process_fb_update_requests(struct nvnc_client* client)
 			return;
 	}
 
-	if (server->key_code_fn && !client->is_qemu_key_ext_notified
-	    && client_has_encoding(client, RFB_ENCODING_QEMU_EXT_KEY_EVENT)) {
-		send_qemu_key_ext_frame(client);
-		client->is_qemu_key_ext_notified = true;
+	if (!client->is_ext_notified) {
+		client->is_ext_notified = true;
 
-		if (--client->n_pending_requests <= 0)
-			return;
+		if (send_ext_support_frame(client)) {
+			if (--client->n_pending_requests <= 0)
+				return;
+		}
 	}
 
 	if (server->cursor_seq != client->cursor_seq
@@ -736,6 +1194,12 @@ static int on_client_fb_update_request(struct nvnc_client* client)
 	nvnc_fb_req_fn fn = server->fb_req_fn;
 	if (fn)
 		fn(client, incremental, x, y, width, height);
+
+	if (!incremental &&
+	    client_has_encoding(client, RFB_ENCODING_EXTENDEDDESKTOPSIZE)) {
+		client->known_width = 0;
+		client->known_height = 0;
+	}
 
 	process_fb_update_requests(client);
 
@@ -932,6 +1396,155 @@ static void process_big_cut_text(struct nvnc_client* client)
 	client->cut_text.buffer = NULL;
 }
 
+static enum rfb_resize_status check_desktop_layout(struct nvnc_client* client,
+		uint16_t width, uint16_t height, uint8_t n_screens,
+		struct rfb_screen* screens)
+{
+	struct nvnc* server = client->server;
+	struct nvnc_desktop_layout* layout;
+	enum rfb_resize_status status = RFB_RESIZE_STATUS_SUCCESS;
+
+	layout = malloc(sizeof(*layout) +
+			n_screens * sizeof(*layout->display_layouts));
+	if (!layout)
+		return RFB_RESIZE_STATUS_OUT_OF_RESOURCES;
+
+	layout->width = width;
+	layout->height = height;
+	layout->n_display_layouts = n_screens;
+
+	for (size_t i = 0; i < n_screens; ++i) {
+		struct nvnc_display_layout* display;
+		struct rfb_screen* screen;
+
+		display = &layout->display_layouts[i];
+		screen = &screens[i];
+
+		nvnc_display_layout_init(display, screen);
+
+		if (screen->id == 0)
+			display->display = server->display;
+
+		if (display->x_pos + display->width > width ||
+		    display->y_pos + display->height > height) {
+			status = RFB_RESIZE_STATUS_INVALID_LAYOUT;
+			goto out;
+		}
+	}
+
+	if (!server->desktop_layout_fn ||
+	    !server->desktop_layout_fn(client, layout))
+		status = RFB_RESIZE_STATUS_PROHIBITED;
+out:
+	free(layout);
+	return status;
+}
+
+static void send_extended_desktop_size(struct nvnc_client* client,
+		enum rfb_resize_initiator initiator,
+		enum rfb_resize_status status)
+{
+	struct rfb_server_fb_update_msg head = {
+		.type = RFB_SERVER_TO_CLIENT_FRAMEBUFFER_UPDATE,
+		.n_rects = htons(1),
+	};
+
+	struct rfb_server_fb_rect rect = {
+		.encoding = htonl(RFB_ENCODING_EXTENDEDDESKTOPSIZE),
+		.x = htons(initiator),
+		.y = htons(status),
+		.width = htons(client->known_width),
+		.height = htons(client->known_height),
+	};
+
+	uint8_t number_of_screens = 1;
+	uint8_t buf[4] = { number_of_screens };
+
+	struct rfb_screen screen = {
+		.width = htons(client->known_width),
+		.height = htons(client->known_height),
+	};
+
+	stream_write(client->net_stream, &head, sizeof(head), NULL, NULL);
+	stream_write(client->net_stream, &rect, sizeof(rect), NULL, NULL);
+	stream_write(client->net_stream, &buf, sizeof(buf), NULL, NULL);
+	stream_write(client->net_stream, &screen, sizeof(screen), NULL, NULL);
+}
+
+static int on_client_set_desktop_size_event(struct nvnc_client* client)
+{
+	struct rfb_client_set_desktop_size_event_msg* msg;
+	enum rfb_resize_status status;
+	uint16_t width, height;
+
+	if (client->buffer_len - client->buffer_index < sizeof(*msg))
+		return 0;
+
+	msg = (struct rfb_client_set_desktop_size_event_msg*)
+	      (client->msg_buffer + client->buffer_index);
+
+	width = ntohs(msg->width);
+	height = ntohs(msg->height);
+
+	status = check_desktop_layout(client, width, height,
+			msg->number_of_screens, msg->screens);
+
+	send_extended_desktop_size(client, RFB_RESIZE_INITIATOR_THIS_CLIENT,
+				   status);
+
+	return sizeof(*msg) + msg->number_of_screens * sizeof(struct rfb_screen);
+}
+
+static void update_ntp_stats(struct nvnc_client* client,
+		const struct rfb_ntp_msg *msg)
+{
+	uint32_t t0 = ntohl(msg->t0);
+	uint32_t t1 = ntohl(msg->t1);
+	uint32_t t2 = ntohl(msg->t2);
+	uint32_t t3 = ntohl(msg->t3);
+
+	double delta = (int32_t)(t3 - t0) - (int32_t)(t2 - t1);
+	double theta = ((int32_t)(t1 - t0) + (int32_t)(t2 - t3)) / 2;
+
+	nvnc_log(NVNC_LOG_DEBUG, "NTP: delta: %.2f ms, theta: %.2f ms",
+			delta / 1e3, theta / 1e3);
+}
+
+static struct rcbuf* on_ntp_msg_send(struct stream* tcp_stream,
+		void* userdata)
+{
+	struct rfb_ntp_msg* msg = userdata;
+	msg->t2 = htonl(gettime_us(CLOCK_MONOTONIC));
+	return rcbuf_from_mem(msg, sizeof(*msg));
+}
+
+static int on_client_ntp(struct nvnc_client* client)
+{
+	struct rfb_ntp_msg msg;
+
+	if (client->buffer_len - client->buffer_index < sizeof(msg))
+		return 0;
+
+	memcpy(&msg, client->msg_buffer + client->buffer_index, sizeof(msg));
+
+	if (msg.t3 != 0) {
+		update_ntp_stats(client, &msg);
+		return sizeof(msg);
+	}
+
+	msg.t1 = htonl(gettime_us(CLOCK_MONOTONIC));
+
+	struct rfb_ntp_msg* out_msg = malloc(sizeof(*out_msg));
+	assert(out_msg);
+	memcpy(out_msg, &msg, sizeof(*out_msg));
+
+	// The callback gets executed as the message is leaving the send queue
+	// so that we can set t2 as late as possible.
+	stream_exec_and_send(client->net_stream, on_ntp_msg_send, out_msg);
+
+	return sizeof(msg);
+}
+
 static int on_client_message(struct nvnc_client* client)
 {
 	if (client->buffer_len - client->buffer_index < 1)
@@ -955,6 +1568,10 @@ static int on_client_message(struct nvnc_client* client)
 		return on_client_cut_text(client);
 	case RFB_CLIENT_TO_SERVER_QEMU:
 		return on_client_qemu_event(client);
+	case RFB_CLIENT_TO_SERVER_SET_DESKTOP_SIZE:
+		return on_client_set_desktop_size_event(client);
+	case RFB_CLIENT_TO_SERVER_NTP:
+		return on_client_ntp(client);
 	}
 
 	nvnc_log(NVNC_LOG_WARNING, "Got uninterpretable message from client: %p (ref %d)",
@@ -982,6 +1599,18 @@ static int try_read_client_message(struct nvnc_client* client)
 	case VNC_CLIENT_STATE_WAITING_FOR_VENCRYPT_PLAIN_AUTH:
 		return on_vencrypt_plain_auth_message(client);
 #endif
+#ifdef HAVE_CRYPTO
+	case VNC_CLIENT_STATE_WAITING_FOR_APPLE_DH_RESPONSE:
+		return on_apple_dh_response(client);
+	case VNC_CLIENT_STATE_WAITING_FOR_RSA_AES_PUBLIC_KEY:
+		return on_rsa_aes_public_key(client);
+	case VNC_CLIENT_STATE_WAITING_FOR_RSA_AES_CHALLENGE:
+		return on_rsa_aes_challenge(client);
+	case VNC_CLIENT_STATE_WAITING_FOR_RSA_AES_CLIENT_HASH:
+		return on_rsa_aes_client_hash(client);
+	case VNC_CLIENT_STATE_WAITING_FOR_RSA_AES_CREDENTIALS:
+		return on_rsa_aes_credentials(client);
+#endif
 	case VNC_CLIENT_STATE_READY:
 		return on_client_message(client);
 	}
@@ -998,7 +1627,7 @@ static void on_client_event(struct stream* stream, enum stream_event event)
 
 	if (event == STREAM_EVENT_REMOTE_CLOSED) {
 		nvnc_log(NVNC_LOG_INFO, "Client %p (%d) hung up", client, client->ref);
-		nvnc_client_close(client);
+		defer_client_close(client);
 		return;
 	}
 
@@ -1086,7 +1715,16 @@ static void on_connection(void* obj)
 
 	record_peer_hostname(fd, client);
 
-	client->net_stream = stream_new(fd, on_client_event, client);
+#ifdef ENABLE_WEBSOCKET
+	if (server->socket_type == NVNC__SOCKET_WEBSOCKET)
+	{
+		client->net_stream = stream_ws_new(fd, on_client_event, client);
+	}
+	else
+#endif
+	{
+		client->net_stream = stream_new(fd, on_client_event, client);
+	}
 	if (!client->net_stream) {
 		nvnc_log(NVNC_LOG_WARNING, "OOM");
 		goto stream_failure;
@@ -1174,8 +1812,13 @@ static int bind_address_tcp(const char* name, int port)
 
 		int one = 1;
 		if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(int)) < 0) {
-			nvnc_log(NVNC_LOG_DEBUG, "Failed to set socket options: %m");
+			nvnc_log(NVNC_LOG_DEBUG, "Failed to set SO_REUSEADDR: %m");
 			goto failure;
+		}
+
+		int sndbuf = 65536;
+		if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(int)) < 0) {
+			nvnc_log(NVNC_LOG_DEBUG, "Failed to set SO_SNDBUF: %m");
 		}
 
 		if (bind(fd, p->ai_addr, p->ai_addrlen) == 0) {
@@ -1217,12 +1860,14 @@ static int bind_address_unix(const char* name)
 	return fd;
 }
 
-static int bind_address(const char* name, uint16_t port, enum addrtype type)
+static int bind_address(const char* name, uint16_t port,
+		enum nvnc__socket_type type)
 {
 	switch (type) {
-	case ADDRTYPE_TCP:
+	case NVNC__SOCKET_TCP:
+	case NVNC__SOCKET_WEBSOCKET:
 		return bind_address_tcp(name, port);
-	case ADDRTYPE_UNIX:
+	case NVNC__SOCKET_UNIX:
 		return bind_address_unix(name);
 	}
 
@@ -1230,7 +1875,8 @@ static int bind_address(const char* name, uint16_t port, enum addrtype type)
 	return -1;
 }
 
-static struct nvnc* open_common(const char* address, uint16_t port, enum addrtype type)
+static struct nvnc* open_common(const char* address, uint16_t port,
+		enum nvnc__socket_type type)
 {
 	nvnc__log_init();
 
@@ -1239,6 +1885,8 @@ static struct nvnc* open_common(const char* address, uint16_t port, enum addrtyp
 	struct nvnc* self = calloc(1, sizeof(*self));
 	if (!self)
 		return NULL;
+
+	self->socket_type = type;
 
 	strcpy(self->name, DEFAULT_NAME);
 
@@ -1265,7 +1913,7 @@ poll_start_failure:
 handle_failure:
 listen_failure:
 	close(self->fd);
-	if (type == ADDRTYPE_UNIX) {
+	if (type == NVNC__SOCKET_UNIX) {
 		unlink(address);
 	}
 bind_failure:
@@ -1277,13 +1925,23 @@ bind_failure:
 EXPORT
 struct nvnc* nvnc_open(const char* address, uint16_t port)
 {
-	return open_common(address, port, ADDRTYPE_TCP);
+	return open_common(address, port, NVNC__SOCKET_TCP);
+}
+
+EXPORT
+struct nvnc* nvnc_open_websocket(const char *address, uint16_t port)
+{
+#ifdef ENABLE_WEBSOCKET
+	return open_common(address, port, NVNC__SOCKET_WEBSOCKET);
+#else
+	return NULL;
+#endif
 }
 
 EXPORT
 struct nvnc* nvnc_open_unix(const char* address)
 {
-	return open_common(address, 0, ADDRTYPE_UNIX);
+	return open_common(address, 0, NVNC__SOCKET_UNIX);
 }
 
 static void unlink_fd_path(int fd)
@@ -1320,6 +1978,11 @@ void nvnc_close(struct nvnc* self)
 	aml_stop(aml_get_default(), self->poll_handle);
 	unlink_fd_path(self->fd);
 	close(self->fd);
+
+#ifdef HAVE_CRYPTO
+	crypto_rsa_priv_key_del(self->rsa_priv);
+	crypto_rsa_pub_key_del(self->rsa_pub);
+#endif
 
 #ifdef ENABLE_TLS
 	if (self->tls_creds) {
@@ -1428,7 +2091,8 @@ static void on_encode_frame_done(struct encoder* encoder, struct rcbuf* result,
 
 static int send_desktop_resize(struct nvnc_client* client, struct nvnc_fb* fb)
 {
-	if (!client_has_encoding(client, RFB_ENCODING_DESKTOPSIZE)) {
+	if (!client_has_encoding(client, RFB_ENCODING_DESKTOPSIZE) &&
+	    !client_has_encoding(client, RFB_ENCODING_EXTENDEDDESKTOPSIZE)) {
 		nvnc_log(NVNC_LOG_ERROR, "Client does not support desktop resizing. Closing connection...");
 		nvnc_client_close(client);
 		return -1;
@@ -1442,6 +2106,13 @@ static int send_desktop_resize(struct nvnc_client* client, struct nvnc_fb* fb)
 
 	pixman_region_union_rect(&client->damage, &client->damage, 0, 0,
 			fb->width, fb->height);
+
+	if (client_has_encoding(client, RFB_ENCODING_EXTENDEDDESKTOPSIZE)) {
+		send_extended_desktop_size(client,
+				RFB_RESIZE_INITIATOR_SERVER,
+				RFB_RESIZE_STATUS_SUCCESS);
+		return 0;
+	}
 
 	struct rfb_server_fb_update_msg head = {
 		.type = RFB_SERVER_TO_CLIENT_FRAMEBUFFER_UPDATE,
@@ -1459,20 +2130,36 @@ static int send_desktop_resize(struct nvnc_client* client, struct nvnc_fb* fb)
 	return 0;
 }
 
-static int send_qemu_key_ext_frame(struct nvnc_client* client)
+static bool send_ext_support_frame(struct nvnc_client* client)
 {
+	int has_qemu_ext =
+		client_has_encoding(client, RFB_ENCODING_QEMU_EXT_KEY_EVENT);
+	int has_ntp = client_has_encoding(client, RFB_ENCODING_NTP);
+	int n_rects = has_qemu_ext + has_ntp;
+	if (n_rects == 0)
+		return false;
+
 	struct rfb_server_fb_update_msg head = {
 		.type = RFB_SERVER_TO_CLIENT_FRAMEBUFFER_UPDATE,
-		.n_rects = htons(1),
+		.n_rects = htons(n_rects),
 	};
-
-	struct rfb_server_fb_rect rect = {
-		.encoding = htonl(RFB_ENCODING_QEMU_EXT_KEY_EVENT),
-	};
-
 	stream_write(client->net_stream, &head, sizeof(head), NULL, NULL);
-	stream_write(client->net_stream, &rect, sizeof(rect), NULL, NULL);
-	return 0;
+
+	if (has_qemu_ext) {
+		struct rfb_server_fb_rect rect = {
+			.encoding = htonl(RFB_ENCODING_QEMU_EXT_KEY_EVENT),
+		};
+		stream_write(client->net_stream, &rect, sizeof(rect), NULL, NULL);
+	}
+
+	if (has_ntp) {
+		struct rfb_server_fb_rect rect = {
+			.encoding = htonl(RFB_ENCODING_NTP),
+		};
+		stream_write(client->net_stream, &rect, sizeof(rect), NULL, NULL);
+	}
+
+	return true;
 }
 
 void nvnc__damage_region(struct nvnc* self, const struct pixman_region16* damage)
@@ -1543,6 +2230,12 @@ EXPORT
 void nvnc_set_cut_text_fn(struct nvnc* self, nvnc_cut_text_fn fn)
 {
 	self->cut_text_fn = fn;
+}
+
+EXPORT
+void nvnc_set_desktop_layout_fn(struct nvnc* self, nvnc_desktop_layout_fn fn)
+{
+	self->desktop_layout_fn = fn;
 }
 
 EXPORT
@@ -1635,9 +2328,8 @@ bool nvnc_has_auth(void)
 }
 
 EXPORT
-int nvnc_enable_auth(struct nvnc* self, const char* privkey_path,
-                     const char* cert_path, nvnc_auth_fn auth_fn,
-                     void* userdata)
+int nvnc_set_tls_creds(struct nvnc* self, const char* privkey_path,
+                     const char* cert_path)
 {
 #ifdef ENABLE_TLS
 	if (self->tls_creds)
@@ -1668,9 +2360,6 @@ int nvnc_enable_auth(struct nvnc* self, const char* privkey_path,
 		goto cert_set_failure;
 	}
 
-	self->auth_fn = auth_fn;
-	self->auth_ud = userdata;
-
 	return 0;
 
 cert_set_failure:
@@ -1678,6 +2367,19 @@ cert_set_failure:
 	self->tls_creds = NULL;
 cert_alloc_failure:
 	gnutls_global_deinit();
+#endif
+	return -1;
+}
+
+EXPORT
+int nvnc_enable_auth(struct nvnc* self, enum nvnc_auth_flags flags,
+		nvnc_auth_fn auth_fn, void* userdata)
+{
+#ifdef HAVE_CRYPTO
+	self->auth_flags = flags;
+	self->auth_fn = auth_fn;
+	self->auth_ud = userdata;
+	return 0;
 #endif
 	return -1;
 }
@@ -1719,4 +2421,20 @@ void nvnc_set_cursor(struct nvnc* self, struct nvnc_fb* fb, uint16_t width,
 	struct nvnc_client* client;
 	LIST_FOREACH(client, &self->clients, link)
 		process_fb_update_requests(client);
+}
+
+EXPORT
+int nvnc_set_rsa_creds(struct nvnc* self, const char* path)
+{
+#ifdef HAVE_CRYPTO
+	crypto_rsa_priv_key_del(self->rsa_priv);
+	crypto_rsa_pub_key_del(self->rsa_pub);
+
+	self->rsa_priv = crypto_rsa_priv_key_new();
+	self->rsa_pub = crypto_rsa_pub_key_new();
+
+	bool ok = crypto_rsa_priv_key_load(self->rsa_priv, self->rsa_pub, path);
+	return ok ? 0 : -1;
+#endif
+	return -1;
 }

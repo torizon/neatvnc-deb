@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020 - 2021 Andri Yngvason
+ * Copyright (c) 2023 Philipp Zabel
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -18,24 +18,21 @@
 
 #include <stdint.h>
 
-struct pixman_region16;
-struct nvnc_fb;
-struct XXH3_state_s;
+struct nvnc_display;
+struct rfb_screen;
 
-struct damage_refinery {
-	struct XXH3_state_s* state;
-	uint32_t* hashes;
-	uint32_t width;
-	uint32_t height;
+struct nvnc_display_layout {
+	struct nvnc_display* display;
+	uint32_t id;
+	uint16_t x_pos, y_pos;
+	uint16_t width, height;
 };
 
-int damage_refinery_init(struct damage_refinery* self, uint32_t width,
-		uint32_t height);
-int damage_refinery_resize(struct damage_refinery* self, uint32_t width,
-		uint32_t height);
-void damage_refinery_destroy(struct damage_refinery* self);
+struct nvnc_desktop_layout {
+	uint16_t width, height;
+	uint8_t n_display_layouts;
+	struct nvnc_display_layout display_layouts[0];
+};
 
-void damage_refine(struct damage_refinery* self,
-		struct pixman_region16* refined, 
-		struct pixman_region16* hint,
-		struct nvnc_fb* buffer);
+void nvnc_display_layout_init(
+		struct nvnc_display_layout* display, struct rfb_screen* screen);

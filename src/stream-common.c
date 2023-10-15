@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020 - 2021 Andri Yngvason
+ * Copyright (c) 2020 - 2023 Andri Yngvason
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -14,28 +14,28 @@
  * PERFORMANCE OF THIS SOFTWARE.
  */
 
-#pragma once
+#include "stream.h"
+#include "stream-common.h"
 
-#include <stdint.h>
+#include <stdlib.h>
 
-struct pixman_region16;
-struct nvnc_fb;
-struct XXH3_state_s;
+void stream_req__finish(struct stream_req* req, enum stream_req_status status)
+{
+	if (req->on_done)
+		req->on_done(req->userdata, status);
 
-struct damage_refinery {
-	struct XXH3_state_s* state;
-	uint32_t* hashes;
-	uint32_t width;
-	uint32_t height;
-};
+	// exec userdata is heap allocated
+	if (req->exec && req->userdata)
+		free(req->userdata);
 
-int damage_refinery_init(struct damage_refinery* self, uint32_t width,
-		uint32_t height);
-int damage_refinery_resize(struct damage_refinery* self, uint32_t width,
-		uint32_t height);
-void damage_refinery_destroy(struct damage_refinery* self);
+	rcbuf_unref(req->payload);
+	free(req);
+}
 
-void damage_refine(struct damage_refinery* self,
-		struct pixman_region16* refined, 
-		struct pixman_region16* hint,
-		struct nvnc_fb* buffer);
+void stream__remote_closed(struct stream* self)
+{
+	stream_close(self);
+
+	if (self->on_event)
+		self->on_event(self, STREAM_EVENT_REMOTE_CLOSED);
+}
