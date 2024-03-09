@@ -83,7 +83,6 @@ struct nvnc_client {
 	struct nvnc_common common;
 	int ref;
 	struct stream* net_stream;
-	char hostname[256];
 	char username[256];
 	struct nvnc* server;
 	enum nvnc_client_state state;
@@ -105,8 +104,11 @@ struct nvnc_client {
 	struct cut_text cut_text;
 	bool is_ext_notified;
 	struct encoder* encoder;
+	struct encoder* zrle_encoder;
+	struct encoder* tight_encoder;
 	uint32_t cursor_seq;
 	int quality;
+	bool formats_changed;
 
 #ifdef HAVE_CRYPTO
 	struct crypto_key* apple_dh_secret;

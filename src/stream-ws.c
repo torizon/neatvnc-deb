@@ -145,7 +145,7 @@ static ssize_t stream_ws_read_frame(struct stream_ws* ws, void* dst,
 	}
 
 	if (!ws_parse_frame_header(&ws->header, ws->read_buffer,
-				ws->read_index)) {
+			ws->read_index)) {
 		return 0;
 	}
 
@@ -230,7 +230,7 @@ static ssize_t stream_ws_read(struct stream* self, void* dst, size_t size)
 }
 
 static int stream_ws_send(struct stream* self, struct rcbuf* payload,
-                stream_req_fn on_done, void* userdata)
+		stream_req_fn on_done, void* userdata)
 {
 	struct stream_ws* ws = (struct stream_ws*)self;
 

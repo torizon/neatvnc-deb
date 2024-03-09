@@ -22,6 +22,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <sys/socket.h>
 
 #define NVNC_NO_PTS UINT64_MAX
 
@@ -141,7 +142,8 @@ void* nvnc_get_userdata(const void* self);
 
 struct nvnc* nvnc_client_get_server(const struct nvnc_client* client);
 bool nvnc_client_supports_cursor(const struct nvnc_client* client);
-const char* nvnc_client_get_hostname(const struct nvnc_client* client);
+int nvnc_client_get_address(const struct nvnc_client* client,
+		struct sockaddr* restrict addr, socklen_t* restrict addrlen);
 const char* nvnc_client_get_auth_username(const struct nvnc_client* client);
 
 struct nvnc_client* nvnc_client_first(struct nvnc* self);
@@ -235,6 +237,9 @@ void nvnc_set_cursor(struct nvnc*, struct nvnc_fb*, uint16_t width,
 		     uint16_t height, uint16_t hotspot_x, uint16_t hotspot_y,
 		     bool is_damaged);
 
+void nvnc_default_logger(const struct nvnc_log_data* meta, const char* message);
+
 void nvnc_set_log_fn(nvnc_log_fn);
+void nvnc_set_log_fn_thread_local(nvnc_log_fn fn);
 void nvnc_set_log_level(enum nvnc_log_level);
 void nvnc__log(const struct nvnc_log_data*, const char* fmt, ...);

@@ -119,11 +119,11 @@ static inline struct tight_encoder* tight_encoder(struct encoder* encoder)
 static int tight_encoder_init_stream(z_stream* zs)
 {
 	int rc = deflateInit2(zs,
-	                      /* compression level: */ 1,
-	                      /*            method: */ Z_DEFLATED,
-	                      /*       window bits: */ 15,
-	                      /*         mem level: */ 9,
-	                      /*          strategy: */ Z_DEFAULT_STRATEGY);
+			/* compression level: */ 1,
+			/*            method: */ Z_DEFLATED,
+			/*       window bits: */ 15,
+			/*         mem level: */ 9,
+			/*          strategy: */ Z_DEFAULT_STRATEGY);
 	return rc == Z_OK ? 0 : -1;
 }
 
@@ -261,7 +261,7 @@ static void tight_encode_size(struct vec* dst, size_t size)
 }
 
 static int tight_deflate(struct tight_tile* tile, void* src,
-			 size_t len, z_stream* zs, bool flush)
+		size_t len, z_stream* zs, bool flush)
 {
 	zs->next_in = src;
 	zs->avail_in = len;
@@ -310,7 +310,7 @@ static void tight_encode_tile_basic(struct tight_encoder* self,
 	for (uint32_t y = y_start; y < y_start + height; ++y) {
 		uint8_t* img = addr + xoff + y * byte_stride;
 		pixel_to_cpixel(row, &cfmt, img, &self->sfmt,
-			bytes_per_cpixel, width);
+				bytes_per_cpixel, width);
 
 		// TODO What to do if the buffer fills up?
 		if (tight_deflate(tile, row, bytes_per_cpixel * width,

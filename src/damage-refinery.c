@@ -133,12 +133,12 @@ static void tile_region_from_region(struct pixman_region16* dst,
 }
 
 void damage_refine(struct damage_refinery* self,
-		struct pixman_region16* refined, 
+		struct pixman_region16* refined,
 		struct pixman_region16* hint,
 		struct nvnc_fb* buffer)
 {
 	assert(self->width == (uint32_t)buffer->width &&
-	       self->height == (uint32_t)buffer->height);
+			self->height == (uint32_t)buffer->height);
 
 	nvnc_fb_map(buffer);
 

@@ -54,10 +54,10 @@ static inline struct raw_encoder* raw_encoder(struct encoder* encoder)
 }
 
 static int raw_encode_box(struct raw_encoder_work* ctx, struct vec* dst,
-                          const struct rfb_pixel_format* dst_fmt,
-                          const struct nvnc_fb* fb,
-                          const struct rfb_pixel_format* src_fmt, int x_start,
-                          int y_start, int stride, int width, int height)
+		const struct rfb_pixel_format* dst_fmt,
+		const struct nvnc_fb* fb,
+		const struct rfb_pixel_format* src_fmt, int x_start,
+		int y_start, int stride, int width, int height)
 {
 	uint16_t x_pos = ctx->x_pos;
 	uint16_t y_pos = ctx->y_pos;
@@ -84,8 +84,8 @@ static int raw_encode_box(struct raw_encoder_work* ctx, struct vec* dst,
 
 	for (int y = y_start; y < y_start + height; ++y) {
 		pixel_to_cpixel(d + dst->len, dst_fmt,
-		                  b + xoff + y * src_stride, src_fmt,
-		                  bpp, width);
+				b + xoff + y * src_stride, src_fmt,
+				bpp, width);
 		dst->len += width * bpp;
 	}
 
@@ -117,7 +117,7 @@ static int raw_encode_frame(struct raw_encoder_work* ctx, struct vec* dst,
 		int box_height = box[i].y2 - y;
 
 		rc = raw_encode_box(ctx, dst, dst_fmt, src, src_fmt, x, y,
-				    src->stride, box_width, box_height);
+				src->stride, box_width, box_height);
 		if (rc < 0)
 			return -1;
 	}

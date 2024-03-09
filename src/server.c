@@ -77,17 +77,16 @@
 static int send_desktop_resize(struct nvnc_client* client, struct nvnc_fb* fb);
 static bool send_ext_support_frame(struct nvnc_client* client);
 static enum rfb_encodings choose_frame_encoding(struct nvnc_client* client,
-		struct nvnc_fb*);
+		const struct nvnc_fb*);
 static void on_encode_frame_done(struct encoder*, struct rcbuf*, uint64_t pts);
 static bool client_has_encoding(const struct nvnc_client* client,
 		enum rfb_encodings encoding);
 static void process_fb_update_requests(struct nvnc_client* client);
 static void sockaddr_to_string(char* dst, size_t sz,
 		const struct sockaddr* addr);
+static const char* encoding_to_string(enum rfb_encodings encoding);
 
-#if defined(GIT_VERSION)
-EXPORT const char nvnc_version[] = GIT_VERSION;
-#elif defined(PROJECT_VERSION)
+#if defined(PROJECT_VERSION)
 EXPORT const char nvnc_version[] = PROJECT_VERSION;
 #else
 EXPORT const char nvnc_version[] = "UNKNOWN";
@@ -143,6 +142,8 @@ static void client_close(struct nvnc_client* client)
 		client->encoder->on_done = NULL;
 	}
 	encoder_unref(client->encoder);
+	encoder_unref(client->zrle_encoder);
+	encoder_unref(client->tight_encoder);
 	pixman_region_fini(&client->damage);
 	free(client->cut_text.buffer);
 	free(client);
@@ -209,7 +210,7 @@ static int handle_unsupported_version(struct nvnc_client* client)
 
 	size_t len = 1 + sizeof(*reason) + strlen(reason_string);
 	stream_write(client->net_stream, buffer, len, close_after_write,
-	             client);
+			client);
 
 	return 0;
 }
@@ -268,8 +269,15 @@ static int on_version_message(struct nvnc_client* client)
 }
 
 static int security_handshake_failed(struct nvnc_client* client,
-                                     const char* reason_string)
+		const char* username, const char* reason_string)
 {
+	if (username)
+		nvnc_log(NVNC_LOG_INFO, "Security handshake failed for \"%s\": %s",
+				username, reason_string);
+	else
+		nvnc_log(NVNC_LOG_INFO, "Security handshake: %s",
+				username, reason_string);
+
 	char buffer[256];
 
 	client->state = VNC_CLIENT_STATE_ERROR;
@@ -285,16 +293,23 @@ static int security_handshake_failed(struct nvnc_client* client,
 
 	size_t len = sizeof(*result) + sizeof(*reason) + strlen(reason_string);
 	stream_write(client->net_stream, buffer, len, close_after_write,
-	             client);
+			client);
 
 	return 0;
 }
 
-static int security_handshake_ok(struct nvnc_client* client)
+static int security_handshake_ok(struct nvnc_client* client, const char* username)
 {
+	if (username) {
+		nvnc_log(NVNC_LOG_INFO, "User \"%s\" authenticated", username);
+
+		strncpy(client->username, username, sizeof(client->username));
+		client->username[sizeof(client->username) - 1] = '\0';
+	}
+
 	uint32_t result = htonl(RFB_SECURITY_HANDSHAKE_OK);
 	return stream_write(client->net_stream, &result, sizeof(result), NULL,
-	                    NULL);
+			NULL);
 }
 
 #ifdef ENABLE_TLS
@@ -306,7 +321,7 @@ static int send_byte(struct nvnc_client* client, uint8_t value)
 static int send_byte_and_close(struct nvnc_client* client, uint8_t value)
 {
 	return stream_write(client->net_stream, &value, 1, close_after_write,
-	                    client);
+			client);
 }
 
 static int vencrypt_send_version(struct nvnc_client* client)
@@ -328,7 +343,8 @@ static int on_vencrypt_version_message(struct nvnc_client* client)
 		return 0;
 
 	if (msg->major != 0 || msg->minor != 2) {
-		security_handshake_failed(client, "Unsupported VeNCrypt version");
+		security_handshake_failed(client, NULL,
+				"Unsupported VeNCrypt version");
 		return sizeof(*msg);
 	}
 
@@ -397,16 +413,12 @@ static int on_vencrypt_plain_auth_message(struct nvnc_client* client)
 	username[MIN(ulen, sizeof(username) - 1)] = '\0';
 	password[MIN(plen, sizeof(password) - 1)] = '\0';
 
-	strncpy(client->username, username, sizeof(client->username));
-	client->username[sizeof(client->username) - 1] = '\0';
-
 	if (server->auth_fn(username, password, server->auth_ud)) {
-		nvnc_log(NVNC_LOG_INFO, "User \"%s\" authenticated", username);
-		security_handshake_ok(client);
+		security_handshake_ok(client, username);
 		client->state = VNC_CLIENT_STATE_WAITING_FOR_INIT;
 	} else {
-		nvnc_log(NVNC_LOG_INFO, "User \"%s\" rejected", username);
-		security_handshake_failed(client, "Invalid username or password");
+		security_handshake_failed(client, username,
+				"Invalid username or password");
 	}
 
 	return sizeof(*msg) + ulen + plen;
@@ -490,12 +502,11 @@ static int on_apple_dh_response(struct nvnc_client* client)
 	crypto_cipher_del(cipher);
 
 	if (server->auth_fn(username, password, server->auth_ud)) {
-		nvnc_log(NVNC_LOG_INFO, "User \"%s\" authenticated", username);
-		security_handshake_ok(client);
+		security_handshake_ok(client, username);
 		client->state = VNC_CLIENT_STATE_WAITING_FOR_INIT;
 	} else {
-		nvnc_log(NVNC_LOG_INFO, "User \"%s\" rejected", username);
-		security_handshake_failed(client, "Invalid username or password");
+		security_handshake_failed(client, username,
+				"Invalid username or password");
 	}
 
 	return sizeof(*msg) + key_len;
@@ -767,12 +778,11 @@ static int on_rsa_aes_credentials(struct nvnc_client* client)
 	password[password_len] = '\0';
 
 	if (server->auth_fn(username, password, server->auth_ud)) {
-		nvnc_log(NVNC_LOG_INFO, "User \"%s\" authenticated", username);
-		security_handshake_ok(client);
+		security_handshake_ok(client, username);
 		client->state = VNC_CLIENT_STATE_WAITING_FOR_INIT;
 	} else {
-		nvnc_log(NVNC_LOG_INFO, "User \"%s\" rejected", username);
-		security_handshake_failed(client, "Invalid username or password");
+		security_handshake_failed(client, username,
+				"Invalid username or password");
 	}
 
 	return 2 + username_len + password_len;
@@ -790,7 +800,7 @@ static int on_security_message(struct nvnc_client* client)
 
 	switch (type) {
 	case RFB_SECURITY_TYPE_NONE:
-		security_handshake_ok(client);
+		security_handshake_ok(client, NULL);
 		client->state = VNC_CLIENT_STATE_WAITING_FOR_INIT;
 		break;
 #ifdef ENABLE_TLS
@@ -820,7 +830,8 @@ static int on_security_message(struct nvnc_client* client)
 		break;
 #endif
 	default:
-		security_handshake_failed(client, "Unsupported security type");
+		security_handshake_failed(client, NULL,
+				"Unsupported security type");
 		break;
 	}
 
@@ -913,6 +924,30 @@ static int on_init_message(struct nvnc_client* client)
 	return sizeof(shared_flag);
 }
 
+static int cook_pixel_map(struct nvnc_client* client)
+{
+	struct rfb_pixel_format* fmt = &client->pixfmt;
+
+	// We'll just pretend that this is rgb332
+	fmt->true_colour_flag = true;
+	fmt->big_endian_flag = false;
+	fmt->bits_per_pixel = 8;
+	fmt->depth = 8;
+	fmt->red_max = 7;
+	fmt->green_max = 7;
+	fmt->blue_max = 3;
+	fmt->red_shift = 5;
+	fmt->green_shift = 2;
+	fmt->blue_shift = 0;
+
+	uint8_t buf[sizeof(struct rfb_set_colour_map_entries_msg)
+		+ 256 * sizeof(struct rfb_colour_map_entry)];
+	struct rfb_set_colour_map_entries_msg* msg =
+		(struct rfb_set_colour_map_entries_msg*)buf;
+	make_rgb332_pal8_map(msg);
+	return stream_write(client->net_stream, buf, sizeof(buf), NULL, NULL);
+}
+
 static int on_client_set_pixel_format(struct nvnc_client* client)
 {
 	if (client->buffer_len - client->buffer_index <
@@ -923,21 +958,40 @@ static int on_client_set_pixel_format(struct nvnc_client* client)
 	        (struct rfb_pixel_format*)(client->msg_buffer +
 	                                   client->buffer_index + 4);
 
-	if (!fmt->true_colour_flag) {
-		/* We don't really know what to do with color maps right now */
-		nvnc_client_close(client);
-		return 0;
+	if (fmt->true_colour_flag) {
+		nvnc_log(NVNC_LOG_DEBUG, "Using color palette for client %p",
+				client);
+		fmt->red_max = ntohs(fmt->red_max);
+		fmt->green_max = ntohs(fmt->green_max);
+		fmt->blue_max = ntohs(fmt->blue_max);
+		memcpy(&client->pixfmt, fmt, sizeof(client->pixfmt));
+	} else {
+		nvnc_log(NVNC_LOG_DEBUG, "Using color palette for client %p",
+				client);
+		cook_pixel_map(client);
 	}
 
-	fmt->red_max = ntohs(fmt->red_max);
-	fmt->green_max = ntohs(fmt->green_max);
-	fmt->blue_max = ntohs(fmt->blue_max);
-
-	memcpy(&client->pixfmt, fmt, sizeof(client->pixfmt));
-
 	client->has_pixfmt = true;
+	client->formats_changed = true;
+
+	nvnc_log(NVNC_LOG_DEBUG, "Client %p chose pixel format: %s", client,
+			rfb_pixfmt_to_string(&client->pixfmt));
 
 	return 4 + sizeof(struct rfb_pixel_format);
+}
+
+static void encodings_to_string_list(char* dst, size_t len,
+		enum rfb_encodings* encodings, size_t n)
+{
+	size_t off = 0;
+
+	if (n > 0)
+		off += snprintf(dst, len, "%s",
+				encoding_to_string(encodings[0]));
+
+	for (size_t i = 1; i < n; ++i)
+		off += snprintf(dst + off, len - off, ",%s",
+				encoding_to_string(encodings[i]));
 }
 
 static int on_client_set_encodings(struct nvnc_client* client)
@@ -946,7 +1000,7 @@ static int on_client_set_encodings(struct nvnc_client* client)
 	        (struct rfb_client_set_encodings_msg*)(client->msg_buffer +
 	                                               client->buffer_index);
 
-	size_t n_encodings = MIN(MAX_ENCODINGS, ntohs(msg->n_encodings));
+	size_t n_encodings = ntohs(msg->n_encodings);
 	size_t n = 0;
 
 	if (client->buffer_len - client->buffer_index <
@@ -955,7 +1009,7 @@ static int on_client_set_encodings(struct nvnc_client* client)
 
 	client->quality = 10;
 
-	for (size_t i = 0; i < n_encodings; ++i) {
+	for (size_t i = 0; i < n_encodings && n < MAX_ENCODINGS; ++i) {
 		enum rfb_encodings encoding = htonl(msg->encodings[i]);
 
 		switch (encoding) {
@@ -971,10 +1025,16 @@ static int on_client_set_encodings(struct nvnc_client* client)
 		case RFB_ENCODING_DESKTOPSIZE:
 		case RFB_ENCODING_EXTENDEDDESKTOPSIZE:
 		case RFB_ENCODING_QEMU_EXT_KEY_EVENT:
+#ifdef ENABLE_EXPERIMENTAL
+		case RFB_ENCODING_PTS:
+		case RFB_ENCODING_NTP:
+#endif
 			client->encodings[n++] = encoding;
+#ifndef ENABLE_EXPERIMENTAL
 		case RFB_ENCODING_PTS:
 		case RFB_ENCODING_NTP:
 			;
+#endif
 		}
 
 		if (RFB_ENCODING_JPEG_LOWQ <= encoding &&
@@ -982,7 +1042,14 @@ static int on_client_set_encodings(struct nvnc_client* client)
 			client->quality = encoding - RFB_ENCODING_JPEG_LOWQ;
 	}
 
+	char encoding_list[256] = {};
+	encodings_to_string_list(encoding_list, sizeof(encoding_list),
+			client->encodings, n);
+	nvnc_log(NVNC_LOG_DEBUG, "Client %p set encodings: %s", client,
+			encoding_list);
+
 	client->n_encodings = n;
+	client->formats_changed = true;
 
 	return sizeof(*msg) + 4 * n_encodings;
 }
@@ -1039,14 +1106,77 @@ static const char* encoding_to_string(enum rfb_encodings encoding)
 {
 	switch (encoding) {
 	case RFB_ENCODING_RAW: return "raw";
+	case RFB_ENCODING_COPYRECT: return "copyrect";
+	case RFB_ENCODING_RRE: return "rre";
+	case RFB_ENCODING_HEXTILE: return "hextile";
 	case RFB_ENCODING_TIGHT: return "tight";
+	case RFB_ENCODING_TRLE: return "trle";
 	case RFB_ENCODING_ZRLE: return "zrle";
 	case RFB_ENCODING_OPEN_H264: return "open-h264";
+	case RFB_ENCODING_CURSOR: return "cursor";
+	case RFB_ENCODING_DESKTOPSIZE: return "desktop-size";
+	case RFB_ENCODING_EXTENDEDDESKTOPSIZE: return "extended-desktop-size";
+	case RFB_ENCODING_QEMU_EXT_KEY_EVENT: return "qemu-extended-key-event";
+	case RFB_ENCODING_PTS: return "pts";
+	case RFB_ENCODING_NTP: return "ntp";
+	}
+	return "UNKNOWN";
+}
+
+static bool ensure_encoder(struct nvnc_client* client, const struct nvnc_fb *fb)
+{
+	struct nvnc* server = client->server;
+
+	enum rfb_encodings encoding = choose_frame_encoding(client, fb);
+	if (client->encoder && encoding == encoder_get_type(client->encoder))
+		return true;
+
+	int width = server->display->buffer->width;
+	int height = server->display->buffer->height;
+	if (client->encoder) {
+		server->n_damage_clients -= !(client->encoder->impl->flags &
+				ENCODER_IMPL_FLAG_IGNORES_DAMAGE);
+		client->encoder->on_done = NULL;
+	}
+	encoder_unref(client->encoder);
+
+	/* Zlib streams need to be saved so we keep encoders around that
+	 * use them.
+	 */
+	switch (encoding) {
+	case RFB_ENCODING_ZRLE:
+		if (!client->zrle_encoder) {
+			client->zrle_encoder =
+				encoder_new(encoding, width, height);
+		}
+		client->encoder = client->zrle_encoder;
+		encoder_ref(client->encoder);
+		break;
+	case RFB_ENCODING_TIGHT:
+		if (!client->tight_encoder) {
+			client->tight_encoder =
+				encoder_new(encoding, width, height);
+		}
+		client->encoder = client->tight_encoder;
+		encoder_ref(client->encoder);
+		break;
 	default:
+		client->encoder = encoder_new(encoding, width, height);
 		break;
 	}
 
-	return "UNKNOWN";
+	if (!client->encoder) {
+		nvnc_log(NVNC_LOG_ERROR, "Failed to allocate new encoder");
+		return false;
+	}
+
+	server->n_damage_clients += !(client->encoder->impl->flags &
+			ENCODER_IMPL_FLAG_IGNORES_DAMAGE);
+
+	nvnc_log(NVNC_LOG_INFO, "Choosing %s encoding for client %p",
+			encoding_to_string(encoding), client);
+
+	return true;
 }
 
 static void process_fb_update_requests(struct nvnc_client* client)
@@ -1098,38 +1228,17 @@ static void process_fb_update_requests(struct nvnc_client* client)
 	if (!pixman_region_not_empty(&client->damage))
 		return;
 
+	if (!ensure_encoder(client, fb))
+		return;
+
 	DTRACE_PROBE1(neatvnc, update_fb_start, client);
-
-	enum rfb_encodings encoding = choose_frame_encoding(client, fb);
-	if (!client->encoder || encoding != encoder_get_type(client->encoder)) {
-		int width = server->display->buffer->width;
-		int height = server->display->buffer->height;
-		if (client->encoder) {
-			server->n_damage_clients -=
-				!(client->encoder->impl->flags &
-						ENCODER_IMPL_FLAG_IGNORES_DAMAGE);
-			client->encoder->on_done = NULL;
-		}
-		encoder_unref(client->encoder);
-		client->encoder = encoder_new(encoding, width, height);
-		if (!client->encoder) {
-			nvnc_log(NVNC_LOG_ERROR, "Failed to allocate new encoder");
-			return;
-		}
-
-		server->n_damage_clients +=
-			!(client->encoder->impl->flags &
-					ENCODER_IMPL_FLAG_IGNORES_DAMAGE);
-
-		nvnc_log(NVNC_LOG_INFO, "Choosing %s encoding for client %p",
-				encoding_to_string(encoding), client);
-	}
 
 	/* The client's damage is exchanged for an empty one */
 	struct pixman_region16 damage = client->damage;
 	pixman_region_init(&client->damage);
 
 	client->is_updating = true;
+	client->formats_changed = false;
 	client->current_fb = fb;
 	nvnc_fb_hold(fb);
 	nvnc_fb_ref(fb);
@@ -1151,6 +1260,7 @@ static void process_fb_update_requests(struct nvnc_client* client)
 		nvnc_log(NVNC_LOG_ERROR, "Failed to encode current frame");
 		client_unref(client);
 		client->is_updating = false;
+		client->formats_changed = false;
 		assert(client->current_fb);
 		nvnc_fb_release(client->current_fb);
 		nvnc_fb_unref(client->current_fb);
@@ -1184,7 +1294,7 @@ static int on_client_fb_update_request(struct nvnc_client* client)
 	 */
 	if (!incremental) {
 		pixman_region_union_rect(&client->damage, &client->damage, x, y,
-		                         width, height);
+				width, height);
 
 		if (client->encoder)
 			encoder_request_key_frame(client->encoder);
@@ -1267,7 +1377,7 @@ static int on_client_qemu_event(struct nvnc_client* client)
 	}
 
 	nvnc_log(NVNC_LOG_WARNING, "Got uninterpretable qemu message from client: %p (ref %d)",
-	          client, client->ref);
+			client, client->ref);
 	nvnc_client_close(client);
 	return 0;
 }
@@ -1326,7 +1436,7 @@ static int on_client_cut_text(struct nvnc_client* client)
 	/* Messages greater than this size are unsupported */
 	if (length > max_length) {
 		nvnc_log(NVNC_LOG_ERROR, "Copied text length (%d) is greater than max supported length (%d)",
-			length, max_length);
+				length, max_length);
 		nvnc_client_close(client);
 		return 0;
 	}
@@ -1377,7 +1487,7 @@ static void process_big_cut_text(struct nvnc_client* client)
 	if (n_read < 0) {
 		if (errno != EAGAIN) {
 			nvnc_log(NVNC_LOG_INFO, "Client connection error: %p (ref %d)",
-				  client, client->ref);
+					client, client->ref);
 			nvnc_client_close(client);
 		}
 
@@ -1491,7 +1601,7 @@ static int on_client_set_desktop_size_event(struct nvnc_client* client)
 			msg->number_of_screens, msg->screens);
 
 	send_extended_desktop_size(client, RFB_RESIZE_INITIATOR_THIS_CLIENT,
-				   status);
+			status);
 
 	return sizeof(*msg) + msg->number_of_screens * sizeof(struct rfb_screen);
 }
@@ -1576,7 +1686,7 @@ static int on_client_message(struct nvnc_client* client)
 	}
 
 	nvnc_log(NVNC_LOG_WARNING, "Got uninterpretable message from client: %p (ref %d)",
-	          client, client->ref);
+			client, client->ref);
 	nvnc_client_close(client);
 	return 0;
 }
@@ -1649,7 +1759,7 @@ static void on_client_event(struct stream* stream, enum stream_event event)
 	if (n_read < 0) {
 		if (errno != EAGAIN) {
 			nvnc_log(NVNC_LOG_INFO, "Client connection error: %p (ref %d)",
-				  client, client->ref);
+					client, client->ref);
 			nvnc_client_close(client);
 		}
 
@@ -1671,28 +1781,8 @@ static void on_client_event(struct stream* stream, enum stream_event event)
 
 	client->buffer_len -= client->buffer_index;
 	memmove(client->msg_buffer, client->msg_buffer + client->buffer_index,
-	        client->buffer_len);
+			client->buffer_len);
 	client->buffer_index = 0;
-}
-
-// TODO: Remove this when nvnc_client_get_hostname gets renamed.
-static void record_peer_hostname(int fd, struct nvnc_client* client)
-{
-	struct sockaddr_storage storage;
-	struct sockaddr* peer = (struct sockaddr*)&storage;
-	socklen_t peerlen = sizeof(storage);
-	if (getpeername(fd, peer, &peerlen) < 0) {
-		nvnc_log(NVNC_LOG_WARNING, "Failed to get address for client: %m");
-		return;
-	}
-
-	if (peer->sa_family == AF_UNIX) {
-		snprintf(client->hostname, sizeof(client->hostname),
-				"unix domain socket");
-	} else {
-		sockaddr_to_string(client->hostname, sizeof(client->hostname),
-				peer);
-	}
 }
 
 static void on_connection(void* obj)
@@ -1715,8 +1805,6 @@ static void on_connection(void* obj)
 
 	int one = 1;
 	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-
-	record_peer_hostname(fd, client);
 
 #ifdef ENABLE_WEBSOCKET
 	if (server->socket_type == NVNC__SOCKET_WEBSOCKET)
@@ -1752,7 +1840,14 @@ static void on_connection(void* obj)
 
 	client->state = VNC_CLIENT_STATE_WAITING_FOR_VERSION;
 
-	nvnc_log(NVNC_LOG_INFO, "New client connection from %s: %p (ref %d)", client->hostname, client, client->ref);
+	char ip_address[256];
+	struct sockaddr_storage addr;
+	socklen_t addrlen = sizeof(addr);
+	nvnc_client_get_address(client, (struct sockaddr*)&addr, &addrlen);
+	sockaddr_to_string(ip_address, sizeof(ip_address),
+			(struct sockaddr*)&addr);
+	nvnc_log(NVNC_LOG_INFO, "New client connection from %s: %p (ref %d)",
+			ip_address, client, client->ref);
 
 	return;
 
@@ -2005,6 +2100,8 @@ void nvnc_close(struct nvnc* self)
 
 static void complete_fb_update(struct nvnc_client* client)
 {
+	if (!client->is_updating)
+		return;
 	client->is_updating = false;
 	assert(client->current_fb);
 	nvnc_fb_release(client->current_fb);
@@ -2022,7 +2119,7 @@ static void on_write_frame_done(void* userdata, enum stream_req_status status)
 }
 
 static enum rfb_encodings choose_frame_encoding(struct nvnc_client* client,
-		struct nvnc_fb* fb)
+		const struct nvnc_fb* fb)
 {
 	for (size_t i = 0; i < client->n_encodings; ++i)
 		switch (client->encodings[i]) {
@@ -2062,6 +2159,17 @@ static void finish_fb_update(struct nvnc_client* client, struct rcbuf* payload,
 	if (client->net_stream->state == STREAM_STATE_CLOSED)
 		goto complete;
 
+	if (client->formats_changed) {
+		/* Client has requested new pixel format or encoding in the
+		 * meantime, so it probably won't know what to do with this
+		 * frame. Pending requests get incremented because this one is
+		 * dropped.
+		 */
+		nvnc_log(NVNC_LOG_DEBUG, "Client changed pixel format or encoding with in-flight buffer");
+		client->n_pending_requests++;
+		goto complete;
+	}
+
 	DTRACE_PROBE2(neatvnc, send_fb_start, client, pts);
 	n_rects += will_send_pts(client, pts) ? 1 : 0;
 	struct rfb_server_fb_update_msg update_msg = {
@@ -2077,7 +2185,7 @@ static void finish_fb_update(struct nvnc_client* client, struct rcbuf* payload,
 
 	rcbuf_ref(payload);
 	if (stream_send(client->net_stream, payload,
-				on_write_frame_done, client) < 0)
+			on_write_frame_done, client) < 0)
 		goto complete;
 
 	DTRACE_PROBE2(neatvnc, send_fb_done, client, pts);
@@ -2177,7 +2285,7 @@ void nvnc__damage_region(struct nvnc* self, const struct pixman_region16* damage
 	LIST_FOREACH(client, &self->clients, link)
 		if (client->net_stream->state != STREAM_STATE_CLOSED)
 			pixman_region_union(&client->damage, &client->damage,
-					    (struct pixman_region16*)damage);
+					(struct pixman_region16*)damage);
 
 	LIST_FOREACH(client, &self->clients, link)
 		process_fb_update_requests(client);
@@ -2274,13 +2382,10 @@ struct nvnc* nvnc_client_get_server(const struct nvnc_client* client)
 	return client->server;
 }
 
-// TODO: This function should be renamed to nvnc_client_get_address and it
-// should return the sockaddr.
 EXPORT
-const char* nvnc_client_get_hostname(const struct nvnc_client* client) {
-	if (client->hostname[0] == '\0')
-		return NULL;
-	return client->hostname;
+int nvnc_client_get_address(const struct nvnc_client* client,
+		struct sockaddr* restrict addr, socklen_t* restrict addrlen) {
+	return getpeername(client->net_stream->fd, addr, addrlen);
 }
 
 EXPORT
@@ -2339,7 +2444,7 @@ bool nvnc_has_auth(void)
 
 EXPORT
 int nvnc_set_tls_creds(struct nvnc* self, const char* privkey_path,
-                     const char* cert_path)
+		const char* cert_path)
 {
 #ifdef ENABLE_TLS
 	if (self->tls_creds)
@@ -2351,22 +2456,22 @@ int nvnc_set_tls_creds(struct nvnc* self, const char* privkey_path,
 	int rc = gnutls_global_init();
 	if (rc != GNUTLS_E_SUCCESS) {
 		nvnc_log(NVNC_LOG_ERROR, "GnuTLS: Failed to initialise: %s",
-		          gnutls_strerror(rc));
+				gnutls_strerror(rc));
 		return -1;
 	}
 
 	rc = gnutls_certificate_allocate_credentials(&self->tls_creds);
 	if (rc != GNUTLS_E_SUCCESS) {
 		nvnc_log(NVNC_LOG_ERROR, "GnuTLS: Failed to allocate credentials: %s",
-		          gnutls_strerror(rc));
+				gnutls_strerror(rc));
 		goto cert_alloc_failure;
 	}
 
 	rc = gnutls_certificate_set_x509_key_file(
-		self->tls_creds, cert_path, privkey_path, GNUTLS_X509_FMT_PEM);
+			self->tls_creds, cert_path, privkey_path, GNUTLS_X509_FMT_PEM);
 	if (rc != GNUTLS_E_SUCCESS) {
 		nvnc_log(NVNC_LOG_ERROR, "GnuTLS: Failed to load credentials: %s",
-		          gnutls_strerror(rc));
+				gnutls_strerror(rc));
 		goto cert_set_failure;
 	}
 
