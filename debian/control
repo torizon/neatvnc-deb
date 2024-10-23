@@ -1,7 +1,7 @@
 Source: neatvnc
 Priority: optional
 Section: libs
-Maintainer: Boyuan Yang <byang@debian.org>
+Maintainer: Toradex Packaging Team <debian-pkg-team@toradex.com>
 Standards-Version: 4.6.2
 Build-Depends:
  debhelper-compat (= 13),
